@@ -25,6 +25,12 @@ let SILVER_KEY = null;
 let latestRates = {
   goldMcx: null,
   silverMcx: null,
+  goldOpen: null,
+  silverOpen: null,
+  goldHigh: null,
+  silverHigh: null,
+  goldLow: null,
+  silverLow: null,
   lastUpdated: null,
   source: "waiting",
   status: "Server started. Waiting for Upstox feed.",
@@ -242,6 +248,12 @@ function calculateRates(goldMcx, silverMcx) {
   return {
     goldMcx: Number.isFinite(gold) ? gold : null,
     silverMcx: Number.isFinite(silver) ? silver : null,
+    goldOpen: latestRates.goldOpen,
+    silverOpen: latestRates.silverOpen,
+    goldHigh: latestRates.goldHigh,
+    silverHigh: latestRates.silverHigh,
+    goldLow: latestRates.goldLow,
+    silverLow: latestRates.silverLow,
 
     goldDifference: gDiff,
     silverDifference: sDiff,
@@ -274,14 +286,13 @@ function broadcast() {
   }
 }
 
+function getFeed(raw, instrumentKey) {
+  return raw?.feeds?.[instrumentKey] || raw?.data?.feeds?.[instrumentKey] || raw?.[instrumentKey] || null;
+}
+
 function extractLtpFromFeed(raw, instrumentKey) {
-  const feed =
-    raw?.feeds?.[instrumentKey] ||
-    raw?.data?.feeds?.[instrumentKey] ||
-    raw?.[instrumentKey];
-
+  const feed = getFeed(raw, instrumentKey);
   if (!feed) return null;
-
   const possibleValues = [
     feed?.ltpc?.ltp,
     feed?.fullFeed?.marketFF?.ltpc?.ltp,
@@ -291,13 +302,24 @@ function extractLtpFromFeed(raw, instrumentKey) {
     feed?.ff?.indexFF?.ltpc?.ltp,
     feed?.ltp,
   ];
-
   for (const value of possibleValues) {
     const num = Number(value);
     if (Number.isFinite(num)) return num;
   }
-
   return null;
+}
+
+function extractDayOhlcFromFeed(raw, instrumentKey) {
+  const feed = getFeed(raw, instrumentKey);
+  const ohlcList = feed?.fullFeed?.marketFF?.marketOHLC?.ohlc || feed?.fullFeed?.indexFF?.marketOHLC?.ohlc || feed?.marketOHLC?.ohlc || [];
+  const day = ohlcList.find((x) => String(x.interval || "").toLowerCase() === "1d") || ohlcList[0];
+  if (!day) return null;
+  const open = Number(day.open), high = Number(day.high), low = Number(day.low);
+  return {
+    open: Number.isFinite(open) ? open : null,
+    high: Number.isFinite(high) ? high : null,
+    low: Number.isFinite(low) ? low : null,
+  };
 }
 
 async function getAuthorizedWebSocketUrl() {
@@ -346,7 +368,7 @@ async function connectUpstox() {
       guid: `bullion-live-${Date.now()}`,
       method: "sub",
       data: {
-        mode: "ltpc",
+        mode: "full_d5",
         instrumentKeys: [GOLD_KEY, SILVER_KEY],
       },
     };
@@ -369,11 +391,23 @@ async function connectUpstox() {
 
       const gold = extractLtpFromFeed(data, GOLD_KEY);
       const silver = extractLtpFromFeed(data, SILVER_KEY);
+      const goldOhlc = extractDayOhlcFromFeed(data, GOLD_KEY);
+      const silverOhlc = extractDayOhlcFromFeed(data, SILVER_KEY);
 
       if (gold != null) latestRates.goldMcx = gold;
       if (silver != null) latestRates.silverMcx = silver;
+      if (goldOhlc) {
+        if (goldOhlc.open != null) latestRates.goldOpen = goldOhlc.open;
+        if (goldOhlc.high != null) latestRates.goldHigh = goldOhlc.high;
+        if (goldOhlc.low != null) latestRates.goldLow = goldOhlc.low;
+      }
+      if (silverOhlc) {
+        if (silverOhlc.open != null) latestRates.silverOpen = silverOhlc.open;
+        if (silverOhlc.high != null) latestRates.silverHigh = silverOhlc.high;
+        if (silverOhlc.low != null) latestRates.silverLow = silverOhlc.low;
+      }
 
-      if (gold != null || silver != null) {
+      if (gold != null || silver != null || goldOhlc || silverOhlc) {
         latestRates.lastUpdated = new Date().toISOString();
         latestRates.source = "upstox";
         latestRates.status = "Live rates updated.";
@@ -416,9 +450,21 @@ app.get("/api/rates", (req, res) => {
 app.post("/api/manual-rates", (req, res) => {
   const gold = Number(req.body.goldMcx);
   const silver = Number(req.body.silverMcx);
+  const goldOpen = Number(req.body.goldOpen);
+  const silverOpen = Number(req.body.silverOpen);
+  const goldHigh = Number(req.body.goldHigh);
+  const silverHigh = Number(req.body.silverHigh);
+  const goldLow = Number(req.body.goldLow);
+  const silverLow = Number(req.body.silverLow);
 
   if (Number.isFinite(gold)) latestRates.goldMcx = gold;
   if (Number.isFinite(silver)) latestRates.silverMcx = silver;
+  if (Number.isFinite(goldOpen)) latestRates.goldOpen = goldOpen;
+  if (Number.isFinite(silverOpen)) latestRates.silverOpen = silverOpen;
+  if (Number.isFinite(goldHigh)) latestRates.goldHigh = goldHigh;
+  if (Number.isFinite(silverHigh)) latestRates.silverHigh = silverHigh;
+  if (Number.isFinite(goldLow)) latestRates.goldLow = goldLow;
+  if (Number.isFinite(silverLow)) latestRates.silverLow = silverLow;
 
   latestRates.lastUpdated = new Date().toISOString();
   latestRates.source = "manual";
@@ -429,11 +475,13 @@ app.post("/api/manual-rates", (req, res) => {
 });
 
 app.post("/api/rate-difference", (req, res) => {
+  const hasGold = Object.prototype.hasOwnProperty.call(req.body, "goldDifference");
+  const hasSilver = Object.prototype.hasOwnProperty.call(req.body, "silverDifference");
   const goldDiff = Number(req.body.goldDifference);
   const silverDiff = Number(req.body.silverDifference);
 
-  if (Number.isFinite(goldDiff)) goldDifference = goldDiff;
-  if (Number.isFinite(silverDiff)) silverDifference = silverDiff;
+  if (hasGold && Number.isFinite(goldDiff)) goldDifference = goldDiff;
+  if (hasSilver && Number.isFinite(silverDiff)) silverDifference = silverDiff;
 
   latestRates.lastUpdated = new Date().toISOString();
   latestRates.status = "Metal rate difference updated.";
