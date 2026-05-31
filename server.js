@@ -8,6 +8,7 @@ const zlib = require("zlib");
 const protobuf = require("protobufjs");
 const fs = require("fs");
 const path = require("path");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 app.use(cors());
@@ -15,9 +16,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 const UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize";
-let accessToken = process.env.UPSTOX_accessToken || null;
+let accessToken = process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_accessToken || null;
 const CACHE_FILE = path.join(__dirname, "rates-cache.json");
 const TOKEN_FILE = path.join(__dirname, "upstox-token.json");
+
+const MONGODB_URI = process.env.MONGODB_URI || "";
+const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "rk_jewellers";
+const TOKEN_COLLECTION = process.env.TOKEN_COLLECTION || "upstox_tokens";
+const TOKEN_DOC_ID = "main-upstox-token";
+
+let mongoClient = null;
+let tokenCollection = null;
 
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
@@ -70,25 +79,91 @@ function saveCachedRates() {
 
 loadCachedRates();
 
-function loadSavedAccessToken() {
+async function initMongoTokenStore() {
+  if (!MONGODB_URI) {
+    console.log("MongoDB token storage not configured. Add MONGODB_URI for permanent token storage.");
+    return;
+  }
+
   try {
-    if (!fs.existsSync(TOKEN_FILE)) return;
-    const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
-    if (saved.access_token) {
-      accessToken = saved.access_token;
-      tokenNeedsReconnect = false;
-      console.log("Loaded saved Upstox access token from token file.");
-    }
+    mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
+    await mongoClient.connect();
+    tokenCollection = mongoClient.db(MONGODB_DB_NAME).collection(TOKEN_COLLECTION);
+    console.log("MongoDB token storage connected.");
   } catch (error) {
-    console.log("Could not load saved Upstox token:", error.message);
+    tokenCollection = null;
+    console.log("MongoDB token storage connection failed:", error.message);
   }
 }
 
-function saveAccessToken(tokenData) {
+async function loadSavedAccessToken() {
+  try {
+    if (tokenCollection) {
+      const saved = await tokenCollection.findOne({ _id: TOKEN_DOC_ID });
+      if (saved?.access_token || saved?.accessToken) {
+        accessToken = saved.access_token || saved.accessToken;
+        tokenNeedsReconnect = false;
+        tokenLastError = null;
+        console.log("Loaded saved Upstox access token from MongoDB.");
+        return;
+      }
+    }
+  } catch (error) {
+    console.log("Could not load Upstox token from MongoDB:", error.message);
+  }
+
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+      if (saved.access_token || saved.accessToken) {
+        accessToken = saved.access_token || saved.accessToken;
+        tokenNeedsReconnect = false;
+        tokenLastError = null;
+        console.log("Loaded saved Upstox access token from token file.");
+        return;
+      }
+    }
+  } catch (error) {
+    console.log("Could not load saved Upstox token file:", error.message);
+  }
+
+  if (accessToken) {
+    tokenNeedsReconnect = false;
+    tokenLastError = null;
+    console.log("Using UPSTOX_ACCESS_TOKEN from Render environment as fallback.");
+  }
+}
+
+async function saveAccessToken(tokenData) {
   accessToken = tokenData.access_token || tokenData.accessToken || accessToken;
   tokenNeedsReconnect = false;
   tokenLastError = null;
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify({ ...tokenData, savedAt: new Date().toISOString() }, null, 2));
+
+  const dataToSave = {
+    ...tokenData,
+    access_token: accessToken,
+    savedAt: new Date().toISOString(),
+    updatedAt: new Date(),
+  };
+
+  try {
+    if (tokenCollection) {
+      await tokenCollection.updateOne(
+        { _id: TOKEN_DOC_ID },
+        { $set: dataToSave },
+        { upsert: true }
+      );
+      console.log("Saved Upstox access token to MongoDB.");
+    }
+  } catch (error) {
+    console.log("Could not save Upstox token to MongoDB:", error.message);
+  }
+
+  try {
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(dataToSave, null, 2));
+  } catch (error) {
+    console.log("Could not save Upstox token file:", error.message);
+  }
 }
 
 function buildPublicBaseUrl(req) {
@@ -117,8 +192,6 @@ function markTokenReconnectNeeded(message) {
   latestRates.source = latestRates.goldMcx || latestRates.silverMcx ? "upstox-last-quote" : "token-expired";
   latestRates.status = tokenLastError;
 }
-
-loadSavedAccessToken();
 
 const clients = new Set();
 
@@ -623,6 +696,8 @@ app.get("/api/upstox/status", (req, res) => {
     tokenLastError,
     loginUrl: UPSTOX_API_KEY ? getUpstoxLoginUrl(req) : null,
     redirectUri: getRedirectUri(req),
+    tokenStorage: tokenCollection ? "mongodb" : (fs.existsSync(TOKEN_FILE) ? "file" : (accessToken ? "env" : "none")),
+    mongoConnected: Boolean(tokenCollection),
     status: latestRates.status,
   });
 });
@@ -654,7 +729,7 @@ app.get("/api/upstox/callback", async (req, res) => {
       timeout: 15000,
     });
 
-    saveAccessToken(response.data);
+    await saveAccessToken(response.data);
     latestRates.status = "Upstox reconnected successfully. Fetching latest rates.";
     latestRates.source = "upstox-reconnected";
     await fetchLastAvailableQuotes();
@@ -725,6 +800,8 @@ app.post("/api/rate-difference", (req, res) => {
 });
 
 async function startServer() {
+  await initMongoTokenStore();
+  await loadSavedAccessToken();
   await prepareInstrumentKeys();
   fetchLastAvailableQuotes();
   setInterval(fetchLastAvailableQuotes, 5 * 60 * 1000);
