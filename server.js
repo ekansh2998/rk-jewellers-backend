@@ -15,8 +15,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 const UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize";
-const ACCESS_TOKEN = process.env.UPSTOX_ACCESS_TOKEN;
+let accessToken = process.env.UPSTOX_accessToken || null;
 const CACHE_FILE = path.join(__dirname, "rates-cache.json");
+const TOKEN_FILE = path.join(__dirname, "upstox-token.json");
+
+const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
+const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
+const UPSTOX_REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI || "";
+
+let tokenNeedsReconnect = false;
+let tokenLastError = null;
+let currentUpstoxWs = null;
 
 // Metal rate difference from .env. You can keep blank/0 and control from frontend/API.
 let goldDifference = Number(process.env.GOLD_RATE_DIFFERENCE || 0);
@@ -60,6 +69,56 @@ function saveCachedRates() {
 }
 
 loadCachedRates();
+
+function loadSavedAccessToken() {
+  try {
+    if (!fs.existsSync(TOKEN_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+    if (saved.access_token) {
+      accessToken = saved.access_token;
+      tokenNeedsReconnect = false;
+      console.log("Loaded saved Upstox access token from token file.");
+    }
+  } catch (error) {
+    console.log("Could not load saved Upstox token:", error.message);
+  }
+}
+
+function saveAccessToken(tokenData) {
+  accessToken = tokenData.access_token || tokenData.accessToken || accessToken;
+  tokenNeedsReconnect = false;
+  tokenLastError = null;
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify({ ...tokenData, savedAt: new Date().toISOString() }, null, 2));
+}
+
+function buildPublicBaseUrl(req) {
+  if (UPSTOX_REDIRECT_URI) return UPSTOX_REDIRECT_URI.replace(/\/api\/upstox\/callback\/?$/, "").replace(/\/$/, "");
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  return `${proto}://${req.get("host")}`;
+}
+
+function getRedirectUri(req) {
+  return UPSTOX_REDIRECT_URI || `${buildPublicBaseUrl(req)}/api/upstox/callback`;
+}
+
+function getUpstoxLoginUrl(req) {
+  const redirectUri = getRedirectUri(req);
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: UPSTOX_API_KEY,
+    redirect_uri: redirectUri,
+  });
+  return `https://api.upstox.com/v2/login/authorization/dialog?${params.toString()}`;
+}
+
+function markTokenReconnectNeeded(message) {
+  tokenNeedsReconnect = true;
+  tokenLastError = message || "Upstox token expired or invalid. Reconnect Upstox once.";
+  latestRates.source = latestRates.goldMcx || latestRates.silverMcx ? "upstox-last-quote" : "token-expired";
+  latestRates.status = tokenLastError;
+}
+
+loadSavedAccessToken();
 
 const clients = new Set();
 
@@ -295,6 +354,9 @@ function calculateRates(goldMcx, silverMcx) {
     lastUpdated: latestRates.lastUpdated,
     source: latestRates.source,
     status: latestRates.status,
+    tokenNeedsReconnect,
+    tokenLastError,
+    reconnectPath: tokenNeedsReconnect ? "/upstox" : null,
     goldInstrumentKey: GOLD_KEY,
     silverInstrumentKey: SILVER_KEY,
   };
@@ -376,13 +438,13 @@ function applyQuoteFallback(quote, metal) {
 }
 
 async function fetchLastAvailableQuotes() {
-  if (!ACCESS_TOKEN || !GOLD_KEY || !SILVER_KEY) return false;
+  if (!accessToken || !GOLD_KEY || !SILVER_KEY) return false;
 
   try {
     const instrumentKeys = encodeURIComponent(`${GOLD_KEY},${SILVER_KEY}`);
     const url = `https://api.upstox.com/v2/market-quote/quotes?instrument_key=${instrumentKeys}`;
     const response = await axios.get(url, {
-      headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, Accept: "application/json" },
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
       timeout: 10000,
     });
 
@@ -401,7 +463,12 @@ async function fetchLastAvailableQuotes() {
       return true;
     }
   } catch (error) {
+    const msg = error.response?.data?.errors?.[0]?.message || error.response?.data?.message || error.message;
     console.log("Last quote fallback failed:", error.response?.data || error.message);
+    if (String(msg).toLowerCase().includes("token") || error.response?.status === 401 || error.response?.status === 403) {
+      markTokenReconnectNeeded("Upstox access token expired/invalid. Open /upstox and reconnect once.");
+      broadcast();
+    }
   }
 
   return false;
@@ -410,7 +477,7 @@ async function fetchLastAvailableQuotes() {
 async function getAuthorizedWebSocketUrl() {
   const response = await axios.get(UPSTOX_AUTHORIZE_URL, {
     headers: {
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      Authorization: `Bearer ${accessToken}`,
       Accept: "application/json",
     },
   });
@@ -419,7 +486,7 @@ async function getAuthorizedWebSocketUrl() {
 }
 
 async function connectUpstox() {
-  if (!ACCESS_TOKEN || !GOLD_KEY || !SILVER_KEY) {
+  if (!accessToken || !GOLD_KEY || !SILVER_KEY) {
     latestRates.status = "Missing access token or instrument keys. Manual mode available.";
     latestRates.source = "manual";
     console.log(latestRates.status);
@@ -430,19 +497,29 @@ async function connectUpstox() {
   try {
     authorizedUrl = await getAuthorizedWebSocketUrl();
   } catch (error) {
-    latestRates.status = `WebSocket authorize error: ${error.response?.data?.errors?.[0]?.message || error.message}`;
-    latestRates.source = "error";
+    const msg = error.response?.data?.errors?.[0]?.message || error.response?.data?.message || error.message;
+    if (String(msg).toLowerCase().includes("token") || error.response?.status === 401 || error.response?.status === 403) {
+      markTokenReconnectNeeded("Upstox access token expired/invalid. Open /upstox and reconnect once.");
+    } else {
+      latestRates.status = `WebSocket authorize error: ${msg}`;
+      latestRates.source = "error";
+    }
     console.error(latestRates.status);
     broadcast();
-    setTimeout(connectUpstox, 10000);
+    setTimeout(connectUpstox, 30000);
     return;
+  }
+
+  if (currentUpstoxWs && currentUpstoxWs.readyState === WebSocket.OPEN) {
+    try { currentUpstoxWs.close(); } catch {}
   }
 
   const ws = new WebSocket(authorizedUrl, {
     headers: {
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      Authorization: `Bearer ${accessToken}`,
     },
   });
+  currentUpstoxWs = ws;
 
   ws.on("open", () => {
     latestRates.status = "Connected to Upstox WebSocket.";
@@ -530,8 +607,69 @@ async function connectUpstox() {
   });
 }
 
+
+app.get("/upstox", (req, res) => {
+  const ready = Boolean(UPSTOX_API_KEY && UPSTOX_API_SECRET);
+  const loginUrl = ready ? getUpstoxLoginUrl(req) : null;
+  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Reconnect Upstox</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px;line-height:1.45}.card{max-width:720px;margin:auto;background:#1d1d1d;border:1px solid #444;border-radius:18px;padding:24px}a.btn{display:inline-block;background:#d4af37;color:#111;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:700}.warn{color:#ffd36a}.ok{color:#74ff8a}code{background:#000;padding:2px 5px;border-radius:5px}</style></head><body><div class="card"><h1>R K Jewellers - Upstox Reconnect</h1><p>Status: <b>${tokenNeedsReconnect ? '<span class="warn">Reconnect required</span>' : '<span class="ok">Token present</span>'}</b></p><p>${tokenLastError || latestRates.status || ''}</p>${ready ? `<p><a class="btn" href="${loginUrl}">Reconnect Upstox Now</a></p>` : `<p class="warn">Missing environment variables. Add <code>UPSTOX_API_KEY</code>, <code>UPSTOX_API_SECRET</code>, and optionally <code>UPSTOX_REDIRECT_URI</code> in Render.</p>`}<p>Redirect URI to add in Upstox app settings:</p><p><code>${getRedirectUri(req)}</code></p><p>After reconnect, open <code>/api/rates</code> again.</p></div></body></html>`);
+});
+
+app.get("/api/upstox/status", (req, res) => {
+  res.json({
+    hasApiKey: Boolean(UPSTOX_API_KEY),
+    hasApiSecret: Boolean(UPSTOX_API_SECRET),
+    hasAccessToken: Boolean(accessToken),
+    tokenNeedsReconnect,
+    tokenLastError,
+    loginUrl: UPSTOX_API_KEY ? getUpstoxLoginUrl(req) : null,
+    redirectUri: getRedirectUri(req),
+    status: latestRates.status,
+  });
+});
+
+app.get("/api/upstox/login", (req, res) => {
+  if (!UPSTOX_API_KEY) return res.status(500).send("Missing UPSTOX_API_KEY in Render Environment.");
+  res.redirect(getUpstoxLoginUrl(req));
+});
+
+app.get("/api/upstox/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Missing authorization code from Upstox.");
+  if (!UPSTOX_API_KEY || !UPSTOX_API_SECRET) return res.status(500).send("Missing UPSTOX_API_KEY or UPSTOX_API_SECRET in Render Environment.");
+
+  try {
+    const form = new URLSearchParams({
+      code: String(code),
+      client_id: UPSTOX_API_KEY,
+      client_secret: UPSTOX_API_SECRET,
+      redirect_uri: getRedirectUri(req),
+      grant_type: "authorization_code",
+    });
+
+    const response = await axios.post("https://api.upstox.com/v2/login/authorization/token", form.toString(), {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      timeout: 15000,
+    });
+
+    saveAccessToken(response.data);
+    latestRates.status = "Upstox reconnected successfully. Fetching latest rates.";
+    latestRates.source = "upstox-reconnected";
+    await fetchLastAvailableQuotes();
+    setTimeout(connectUpstox, 1000);
+
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">Upstox connected successfully ✅</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
+  } catch (error) {
+    const details = JSON.stringify(error.response?.data || error.message);
+    console.error("Upstox token exchange failed:", details);
+    res.status(500).send(`Upstox token exchange failed: ${details}`);
+  }
+});
+
 app.get("/", (req, res) => {
-  res.json({ message: "R K Jewellers backend is running", rates: "/api/rates" });
+  res.json({ message: "R K Jewellers backend is running", rates: "/api/rates", upstoxReconnect: "/upstox" });
 });
 
 app.get("/rates", (req, res) => {
