@@ -9,8 +9,8 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "protobufjs": "^8.5.0",
-"ws": "^8.21.0",
-"mongodb": "^6.11.0"
+    "ws": "^8.21.0",
+    "mongodb": "^6.12.0"
   },
   "devDependencies": {
     "nodemon": "latest"

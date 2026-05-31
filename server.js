@@ -16,7 +16,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 const UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize";
+const UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token";
 let accessToken = process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_accessToken || null;
+let refreshToken = process.env.UPSTOX_REFRESH_TOKEN || process.env.UPSTOX_refreshToken || null;
+let accessTokenExpiresAt = process.env.UPSTOX_TOKEN_EXPIRES_AT || null;
+let lastAutoRefreshAt = null;
 const CACHE_FILE = path.join(__dirname, "rates-cache.json");
 const TOKEN_FILE = path.join(__dirname, "upstox-token.json");
 
@@ -35,6 +39,7 @@ const UPSTOX_REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI || "";
 let tokenNeedsReconnect = false;
 let tokenLastError = null;
 let currentUpstoxWs = null;
+let tokenAutoRefreshEnabled = false;
 
 // Metal rate difference from .env. You can keep blank/0 and control from frontend/API.
 let goldDifference = Number(process.env.GOLD_RATE_DIFFERENCE || 0);
@@ -96,17 +101,31 @@ async function initMongoTokenStore() {
   }
 }
 
+function applySavedTokenData(saved, sourceLabel) {
+  if (!saved) return false;
+  const savedAccess = saved.access_token || saved.accessToken;
+  const savedRefresh = saved.refresh_token || saved.refreshToken;
+  const savedExpiresAt = saved.expires_at || saved.expiresAt || saved.accessTokenExpiresAt;
+
+  if (savedAccess) accessToken = savedAccess;
+  if (savedRefresh) refreshToken = savedRefresh;
+  if (savedExpiresAt) accessTokenExpiresAt = savedExpiresAt;
+
+  if (accessToken) {
+    tokenNeedsReconnect = false;
+    tokenLastError = null;
+    tokenAutoRefreshEnabled = Boolean(refreshToken);
+    console.log(`Loaded saved Upstox token data from ${sourceLabel}. Auto refresh: ${tokenAutoRefreshEnabled ? "enabled" : "not available"}.`);
+    return true;
+  }
+  return false;
+}
+
 async function loadSavedAccessToken() {
   try {
     if (tokenCollection) {
       const saved = await tokenCollection.findOne({ _id: TOKEN_DOC_ID });
-      if (saved?.access_token || saved?.accessToken) {
-        accessToken = saved.access_token || saved.accessToken;
-        tokenNeedsReconnect = false;
-        tokenLastError = null;
-        console.log("Loaded saved Upstox access token from MongoDB.");
-        return;
-      }
+      if (applySavedTokenData(saved, "MongoDB")) return;
     }
   } catch (error) {
     console.log("Could not load Upstox token from MongoDB:", error.message);
@@ -115,13 +134,7 @@ async function loadSavedAccessToken() {
   try {
     if (fs.existsSync(TOKEN_FILE)) {
       const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
-      if (saved.access_token || saved.accessToken) {
-        accessToken = saved.access_token || saved.accessToken;
-        tokenNeedsReconnect = false;
-        tokenLastError = null;
-        console.log("Loaded saved Upstox access token from token file.");
-        return;
-      }
+      if (applySavedTokenData(saved, "token file")) return;
     }
   } catch (error) {
     console.log("Could not load saved Upstox token file:", error.message);
@@ -130,18 +143,38 @@ async function loadSavedAccessToken() {
   if (accessToken) {
     tokenNeedsReconnect = false;
     tokenLastError = null;
-    console.log("Using UPSTOX_ACCESS_TOKEN from Render environment as fallback.");
+    tokenAutoRefreshEnabled = Boolean(refreshToken);
+    console.log(`Using Upstox token from Render environment as fallback. Auto refresh: ${tokenAutoRefreshEnabled ? "enabled" : "not available"}.`);
   }
+}
+
+function buildTokenExpiry(tokenData) {
+  const rawExpiresAt = tokenData.expires_at || tokenData.expiresAt;
+  if (rawExpiresAt) return new Date(rawExpiresAt).toISOString();
+
+  const expiresInSeconds = Number(tokenData.expires_in || tokenData.expiresIn);
+  if (Number.isFinite(expiresInSeconds) && expiresInSeconds > 0) {
+    return new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+  }
+
+  // Safe fallback: many broker access tokens are short lived. Refresh once per day if no expiry is returned.
+  return new Date(Date.now() + 23 * 60 * 60 * 1000).toISOString();
 }
 
 async function saveAccessToken(tokenData) {
   accessToken = tokenData.access_token || tokenData.accessToken || accessToken;
+  refreshToken = tokenData.refresh_token || tokenData.refreshToken || refreshToken;
+  accessTokenExpiresAt = buildTokenExpiry(tokenData);
   tokenNeedsReconnect = false;
   tokenLastError = null;
+  tokenAutoRefreshEnabled = Boolean(refreshToken);
 
   const dataToSave = {
     ...tokenData,
     access_token: accessToken,
+    refresh_token: refreshToken,
+    expires_at: accessTokenExpiresAt,
+    autoRefreshEnabled: tokenAutoRefreshEnabled,
     savedAt: new Date().toISOString(),
     updatedAt: new Date(),
   };
@@ -153,7 +186,7 @@ async function saveAccessToken(tokenData) {
         { $set: dataToSave },
         { upsert: true }
       );
-      console.log("Saved Upstox access token to MongoDB.");
+      console.log(`Saved Upstox token data to MongoDB. Auto refresh: ${tokenAutoRefreshEnabled ? "enabled" : "not available"}.`);
     }
   } catch (error) {
     console.log("Could not save Upstox token to MongoDB:", error.message);
@@ -164,6 +197,63 @@ async function saveAccessToken(tokenData) {
   } catch (error) {
     console.log("Could not save Upstox token file:", error.message);
   }
+}
+
+function isTokenExpiringSoon(bufferMs = 10 * 60 * 1000) {
+  if (!accessTokenExpiresAt) return false;
+  const expiryTime = new Date(accessTokenExpiresAt).getTime();
+  if (!Number.isFinite(expiryTime)) return false;
+  return Date.now() + bufferMs >= expiryTime;
+}
+
+async function refreshAccessTokenIfPossible(force = false) {
+  if (!refreshToken || !UPSTOX_API_KEY || !UPSTOX_API_SECRET) {
+    tokenAutoRefreshEnabled = false;
+    return false;
+  }
+
+  if (!force && !isTokenExpiringSoon()) return false;
+
+  try {
+    const form = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: UPSTOX_API_KEY,
+      client_secret: UPSTOX_API_SECRET,
+    });
+
+    // Some OAuth providers require redirect_uri on refresh as well; include it only when configured.
+    if (UPSTOX_REDIRECT_URI) form.set("redirect_uri", UPSTOX_REDIRECT_URI);
+
+    const response = await axios.post(UPSTOX_TOKEN_URL, form.toString(), {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      timeout: 15000,
+    });
+
+    await saveAccessToken({ ...response.data, refresh_token: response.data.refresh_token || refreshToken });
+    lastAutoRefreshAt = new Date().toISOString();
+    latestRates.status = "Upstox token auto-refreshed successfully.";
+    console.log("Upstox access token auto-refreshed successfully.");
+    return true;
+  } catch (error) {
+    const details = error.response?.data || error.message;
+    console.log("Upstox auto refresh failed:", details);
+    markTokenReconnectNeeded("Upstox auto refresh failed. Open /upstox once to reconnect and save a new refresh token.");
+    return false;
+  }
+}
+
+async function ensureValidAccessToken() {
+  if (!accessToken) {
+    await loadSavedAccessToken();
+  }
+  if (isTokenExpiringSoon()) {
+    await refreshAccessTokenIfPossible(false);
+  }
+  return Boolean(accessToken);
 }
 
 function buildPublicBaseUrl(req) {
@@ -429,6 +519,10 @@ function calculateRates(goldMcx, silverMcx) {
     status: latestRates.status,
     tokenNeedsReconnect,
     tokenLastError,
+    tokenAutoRefreshEnabled,
+    refreshTokenPresent: Boolean(refreshToken),
+    accessTokenExpiresAt,
+    lastAutoRefreshAt,
     reconnectPath: tokenNeedsReconnect ? "/upstox" : null,
     goldInstrumentKey: GOLD_KEY,
     silverInstrumentKey: SILVER_KEY,
@@ -511,6 +605,7 @@ function applyQuoteFallback(quote, metal) {
 }
 
 async function fetchLastAvailableQuotes() {
+  await ensureValidAccessToken();
   if (!accessToken || !GOLD_KEY || !SILVER_KEY) return false;
 
   try {
@@ -539,7 +634,9 @@ async function fetchLastAvailableQuotes() {
     const msg = error.response?.data?.errors?.[0]?.message || error.response?.data?.message || error.message;
     console.log("Last quote fallback failed:", error.response?.data || error.message);
     if (String(msg).toLowerCase().includes("token") || error.response?.status === 401 || error.response?.status === 403) {
-      markTokenReconnectNeeded("Upstox access token expired/invalid. Open /upstox and reconnect once.");
+      const refreshed = await refreshAccessTokenIfPossible(true);
+      if (refreshed) return fetchLastAvailableQuotes();
+      markTokenReconnectNeeded("Upstox access token expired/invalid and auto refresh is unavailable. Open /upstox once.");
       broadcast();
     }
   }
@@ -548,14 +645,31 @@ async function fetchLastAvailableQuotes() {
 }
 
 async function getAuthorizedWebSocketUrl() {
-  const response = await axios.get(UPSTOX_AUTHORIZE_URL, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
-    },
-  });
+  await ensureValidAccessToken();
+  try {
+    const response = await axios.get(UPSTOX_AUTHORIZE_URL, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+      },
+    });
 
-  return response.data.data.authorized_redirect_uri;
+    return response.data.data.authorized_redirect_uri;
+  } catch (error) {
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      const refreshed = await refreshAccessTokenIfPossible(true);
+      if (refreshed) {
+        const response = await axios.get(UPSTOX_AUTHORIZE_URL, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: "application/json",
+          },
+        });
+        return response.data.data.authorized_redirect_uri;
+      }
+    }
+    throw error;
+  }
 }
 
 async function connectUpstox() {
@@ -572,7 +686,7 @@ async function connectUpstox() {
   } catch (error) {
     const msg = error.response?.data?.errors?.[0]?.message || error.response?.data?.message || error.message;
     if (String(msg).toLowerCase().includes("token") || error.response?.status === 401 || error.response?.status === 403) {
-      markTokenReconnectNeeded("Upstox access token expired/invalid. Open /upstox and reconnect once.");
+      markTokenReconnectNeeded("Upstox access token expired/invalid and auto refresh is unavailable. Open /upstox once.");
     } else {
       latestRates.status = `WebSocket authorize error: ${msg}`;
       latestRates.source = "error";
@@ -684,7 +798,7 @@ async function connectUpstox() {
 app.get("/upstox", (req, res) => {
   const ready = Boolean(UPSTOX_API_KEY && UPSTOX_API_SECRET);
   const loginUrl = ready ? getUpstoxLoginUrl(req) : null;
-  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Reconnect Upstox</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px;line-height:1.45}.card{max-width:720px;margin:auto;background:#1d1d1d;border:1px solid #444;border-radius:18px;padding:24px}a.btn{display:inline-block;background:#d4af37;color:#111;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:700}.warn{color:#ffd36a}.ok{color:#74ff8a}code{background:#000;padding:2px 5px;border-radius:5px}</style></head><body><div class="card"><h1>R K Jewellers - Upstox Reconnect</h1><p>Status: <b>${tokenNeedsReconnect ? '<span class="warn">Reconnect required</span>' : '<span class="ok">Token present</span>'}</b></p><p>${tokenLastError || latestRates.status || ''}</p>${ready ? `<p><a class="btn" href="${loginUrl}">Reconnect Upstox Now</a></p>` : `<p class="warn">Missing environment variables. Add <code>UPSTOX_API_KEY</code>, <code>UPSTOX_API_SECRET</code>, and optionally <code>UPSTOX_REDIRECT_URI</code> in Render.</p>`}<p>Redirect URI to add in Upstox app settings:</p><p><code>${getRedirectUri(req)}</code></p><p>After reconnect, open <code>/api/rates</code> again.</p></div></body></html>`);
+  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Reconnect Upstox</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px;line-height:1.45}.card{max-width:720px;margin:auto;background:#1d1d1d;border:1px solid #444;border-radius:18px;padding:24px}a.btn{display:inline-block;background:#d4af37;color:#111;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:700}.warn{color:#ffd36a}.ok{color:#74ff8a}code{background:#000;padding:2px 5px;border-radius:5px}</style></head><body><div class="card"><h1>R K Jewellers - Upstox Reconnect</h1><p>Status: <b>${tokenNeedsReconnect ? '<span class="warn">Reconnect required</span>' : '<span class="ok">Token present</span>'}</b></p><p>${tokenLastError || latestRates.status || ''}</p>${ready ? `<p><a class="btn" href="${loginUrl}">Reconnect Upstox Now</a></p>` : `<p class="warn">Missing environment variables. Add <code>UPSTOX_API_KEY</code>, <code>UPSTOX_API_SECRET</code>, and optionally <code>UPSTOX_REDIRECT_URI</code> in Render.</p>`}<p>Redirect URI to add in Upstox app settings:</p><p><code>${getRedirectUri(req)}</code></p><p>After reconnect, the backend will save access token, refresh token, and expiry time in MongoDB when Upstox returns them. Auto refresh runs in the background before expiry.</p><p>After reconnect, open <code>/api/rates</code> again.</p></div></body></html>`);
 });
 
 app.get("/api/upstox/status", (req, res) => {
@@ -698,6 +812,10 @@ app.get("/api/upstox/status", (req, res) => {
     redirectUri: getRedirectUri(req),
     tokenStorage: tokenCollection ? "mongodb" : (fs.existsSync(TOKEN_FILE) ? "file" : (accessToken ? "env" : "none")),
     mongoConnected: Boolean(tokenCollection),
+    refreshTokenPresent: Boolean(refreshToken),
+    tokenAutoRefreshEnabled,
+    accessTokenExpiresAt,
+    lastAutoRefreshAt,
     status: latestRates.status,
   });
 });
@@ -721,7 +839,7 @@ app.get("/api/upstox/callback", async (req, res) => {
       grant_type: "authorization_code",
     });
 
-    const response = await axios.post("https://api.upstox.com/v2/login/authorization/token", form.toString(), {
+    const response = await axios.post(UPSTOX_TOKEN_URL, form.toString(), {
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         Accept: "application/json",
@@ -735,7 +853,7 @@ app.get("/api/upstox/callback", async (req, res) => {
     await fetchLastAvailableQuotes();
     setTimeout(connectUpstox, 1000);
 
-    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">Upstox connected successfully ✅</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">Upstox connected successfully ✅</h1><p>You can close this page now.</p><p>If Upstox returned a refresh token, future access-token renewal will happen automatically in the background and will be saved in MongoDB.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
   } catch (error) {
     const details = JSON.stringify(error.response?.data || error.message);
     console.error("Upstox token exchange failed:", details);
@@ -805,6 +923,14 @@ async function startServer() {
   await prepareInstrumentKeys();
   fetchLastAvailableQuotes();
   setInterval(fetchLastAvailableQuotes, 5 * 60 * 1000);
+  setInterval(async () => {
+    const oldToken = accessToken;
+    const refreshed = await refreshAccessTokenIfPossible(false);
+    if (refreshed && oldToken !== accessToken) {
+      try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
+      setTimeout(connectUpstox, 1000);
+    }
+  }, 15 * 60 * 1000);
 
   const httpServer = app.listen(PORT, () => {
     console.log(`Backend running at http://localhost:${PORT}`);
