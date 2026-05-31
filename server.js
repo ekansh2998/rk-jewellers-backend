@@ -6,6 +6,8 @@ const WebSocket = require("ws");
 const axios = require("axios");
 const zlib = require("zlib");
 const protobuf = require("protobufjs");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -14,6 +16,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 4000;
 const UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize";
 const ACCESS_TOKEN = process.env.UPSTOX_ACCESS_TOKEN;
+const CACHE_FILE = path.join(__dirname, "rates-cache.json");
 
 // Metal rate difference from .env. You can keep blank/0 and control from frontend/API.
 let goldDifference = Number(process.env.GOLD_RATE_DIFFERENCE || 0);
@@ -35,6 +38,28 @@ let latestRates = {
   source: "waiting",
   status: "Server started. Waiting for Upstox feed.",
 };
+
+function loadCachedRates() {
+  try {
+    if (!fs.existsSync(CACHE_FILE)) return;
+    const cached = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+    latestRates = { ...latestRates, ...cached, source: "cache", status: "Showing saved last available rates until live MCX starts." };
+    console.log("Loaded saved last available rates from cache.");
+  } catch (error) {
+    console.log("Could not load saved rates cache:", error.message);
+  }
+}
+
+function saveCachedRates() {
+  try {
+    if (latestRates.goldMcx == null && latestRates.silverMcx == null) return;
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(latestRates, null, 2));
+  } catch (error) {
+    console.log("Could not save rates cache:", error.message);
+  }
+}
+
+loadCachedRates();
 
 const clients = new Set();
 
@@ -322,6 +347,66 @@ function extractDayOhlcFromFeed(raw, instrumentKey) {
   };
 }
 
+function pickQuoteObject(data, instrumentKey) {
+  const root = data?.data || data;
+  if (!root) return null;
+  if (root[instrumentKey]) return root[instrumentKey];
+  return Object.values(root).find((item) =>
+    item?.instrument_key === instrumentKey ||
+    item?.instrumentKey === instrumentKey ||
+    item?.symbol === instrumentKey ||
+    item?.instrument_token === instrumentKey
+  ) || null;
+}
+
+function applyQuoteFallback(quote, metal) {
+  if (!quote) return false;
+  const ltp = Number(quote.last_price ?? quote.ltp ?? quote.lastPrice ?? quote.close ?? quote.cp);
+  const ohlc = quote.ohlc || quote.OHLC || quote.day_ohlc || {};
+  const open = Number(ohlc.open ?? quote.open);
+  const high = Number(ohlc.high ?? quote.high);
+  const low = Number(ohlc.low ?? quote.low);
+
+  let updated = false;
+  if (Number.isFinite(ltp)) { latestRates[`${metal}Mcx`] = ltp; updated = true; }
+  if (Number.isFinite(open)) { latestRates[`${metal}Open`] = open; updated = true; }
+  if (Number.isFinite(high)) { latestRates[`${metal}High`] = high; updated = true; }
+  if (Number.isFinite(low)) { latestRates[`${metal}Low`] = low; updated = true; }
+  return updated;
+}
+
+async function fetchLastAvailableQuotes() {
+  if (!ACCESS_TOKEN || !GOLD_KEY || !SILVER_KEY) return false;
+
+  try {
+    const instrumentKeys = encodeURIComponent(`${GOLD_KEY},${SILVER_KEY}`);
+    const url = `https://api.upstox.com/v2/market-quote/quotes?instrument_key=${instrumentKeys}`;
+    const response = await axios.get(url, {
+      headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, Accept: "application/json" },
+      timeout: 10000,
+    });
+
+    const goldQuote = pickQuoteObject(response.data, GOLD_KEY);
+    const silverQuote = pickQuoteObject(response.data, SILVER_KEY);
+    const updatedGold = applyQuoteFallback(goldQuote, "gold");
+    const updatedSilver = applyQuoteFallback(silverQuote, "silver");
+
+    if (updatedGold || updatedSilver) {
+      latestRates.lastUpdated = new Date().toISOString();
+      latestRates.source = "upstox-last-quote";
+      latestRates.status = "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
+      saveCachedRates();
+      broadcast();
+      console.log("Last available quotes updated from Upstox REST API.");
+      return true;
+    }
+  } catch (error) {
+    console.log("Last quote fallback failed:", error.response?.data || error.message);
+  }
+
+  return false;
+}
+
 async function getAuthorizedWebSocketUrl() {
   const response = await axios.get(UPSTOX_AUTHORIZE_URL, {
     headers: {
@@ -415,9 +500,11 @@ async function connectUpstox() {
           gold: latestRates.goldMcx,
           silver: latestRates.silverMcx,
         });
+        saveCachedRates();
         broadcast();
       } else if (data?.type === "market_info") {
         latestRates.status = "Market info received. Waiting for live prices.";
+        fetchLastAvailableQuotes();
         broadcast();
       }
     } catch (error) {
@@ -442,6 +529,14 @@ async function connectUpstox() {
     setTimeout(connectUpstox, 5000);
   });
 }
+
+app.get("/", (req, res) => {
+  res.json({ message: "R K Jewellers backend is running", rates: "/api/rates" });
+});
+
+app.get("/rates", (req, res) => {
+  res.redirect("/api/rates");
+});
 
 app.get("/api/rates", (req, res) => {
   res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
@@ -469,6 +564,7 @@ app.post("/api/manual-rates", (req, res) => {
   latestRates.lastUpdated = new Date().toISOString();
   latestRates.source = "manual";
   latestRates.status = "Manual rates saved.";
+  saveCachedRates();
   broadcast();
 
   res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
@@ -492,6 +588,8 @@ app.post("/api/rate-difference", (req, res) => {
 
 async function startServer() {
   await prepareInstrumentKeys();
+  fetchLastAvailableQuotes();
+  setInterval(fetchLastAvailableQuotes, 5 * 60 * 1000);
 
   const httpServer = app.listen(PORT, () => {
     console.log(`Backend running at http://localhost:${PORT}`);
