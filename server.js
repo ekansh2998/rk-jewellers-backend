@@ -492,6 +492,10 @@ function calculateRates(goldMcx, silverMcx) {
     accessTokenExpiresAt,
     lastAutoRefreshAt,
     reconnectPath: tokenNeedsReconnect ? "/upstox" : null,
+    mongoConnected: Boolean(tokenCollection),
+    tokenStorage: tokenCollection ? "mongodb" : (fs.existsSync(TOKEN_FILE) ? "file" : (accessToken ? "render-env-backup" : "none")),
+    usingRenderBackupToken: !tokenCollection && Boolean(accessToken),
+    mongoWarning: !tokenCollection ? "MongoDB disconnected. Using backup access token from server." : null,
     goldInstrumentKey: GOLD_KEY,
     silverInstrumentKey: SILVER_KEY,
   };
@@ -855,6 +859,10 @@ app.get("/api/upstox/callback", async (req, res) => {
     });
 
     await saveAccessToken(response.data);
+    const newTokenFromReconnect = response.data?.access_token || response.data?.accessToken;
+    if (newTokenFromReconnect) {
+      await updateRenderAccessTokenEnv(newTokenFromReconnect);
+    }
     latestRates.status = "Upstox reconnected successfully. Fetching latest rates.";
     latestRates.source = "upstox-reconnected";
     await fetchLastAvailableQuotes();
