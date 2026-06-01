@@ -17,9 +17,13 @@ app.use(express.json());
 const PORT = process.env.PORT || 4000;
 const UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize";
 const UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token";
-let accessToken = process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_accessToken || null;
+const renderEnvAccessToken = process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_accessToken || null;
+let accessToken = renderEnvAccessToken || null;
+let activeTokenSource = renderEnvAccessToken ? "render-env-backup" : "none";
+let memoryBackupAccessToken = renderEnvAccessToken || null;
 let refreshToken = null; // Upstox does not provide refresh-token auto renewal in this setup.
 let accessTokenExpiresAt = process.env.UPSTOX_TOKEN_EXPIRES_AT || null;
+let accessTokenUpdatedAt = process.env.UPSTOX_TOKEN_UPDATED_AT || null;
 let lastAutoRefreshAt = null;
 const CACHE_FILE = path.join(__dirname, "rates-cache.json");
 const TOKEN_FILE = path.join(__dirname, "upstox-token.json");
@@ -31,6 +35,7 @@ const TOKEN_DOC_ID = "main-upstox-token";
 
 let mongoClient = null;
 let tokenCollection = null;
+let mongoLastError = null;
 
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
@@ -44,6 +49,8 @@ let tokenAutoRefreshEnabled = false; // intentionally disabled: Upstox refresh-t
 // Metal rate difference from .env. You can keep blank/0 and control from frontend/API.
 let goldDifference = Number(process.env.GOLD_RATE_DIFFERENCE || 0);
 let silverDifference = Number(process.env.SILVER_RATE_DIFFERENCE || 0);
+let goldDifferenceUpdatedAt = process.env.GOLD_RATE_DIFFERENCE_UPDATED_AT || null;
+let silverDifferenceUpdatedAt = process.env.SILVER_RATE_DIFFERENCE_UPDATED_AT || null;
 
 let GOLD_KEY = null;
 let SILVER_KEY = null;
@@ -94,9 +101,11 @@ async function initMongoTokenStore() {
     mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
     await mongoClient.connect();
     tokenCollection = mongoClient.db(MONGODB_DB_NAME).collection(TOKEN_COLLECTION);
+    mongoLastError = null;
     console.log("MongoDB token storage connected.");
   } catch (error) {
     tokenCollection = null;
+    mongoLastError = error.message;
     console.log("MongoDB token storage connection failed:", error.message);
   }
 }
@@ -106,10 +115,16 @@ function applySavedTokenData(saved, sourceLabel) {
   const savedAccess = saved.access_token || saved.accessToken;
   const savedRefresh = saved.refresh_token || saved.refreshToken;
   const savedExpiresAt = saved.expires_at || saved.expiresAt || saved.accessTokenExpiresAt;
+  const savedUpdatedAt = saved.updatedAt || saved.savedAt || saved.accessTokenUpdatedAt;
 
-  if (savedAccess) accessToken = savedAccess;
+  if (savedAccess) {
+    accessToken = savedAccess;
+    memoryBackupAccessToken = savedAccess;
+    activeTokenSource = sourceLabel === "MongoDB" ? "mongodb" : (sourceLabel === "Render environment" ? "render-env-backup" : "server-memory-backup");
+  }
   if (savedRefresh) refreshToken = savedRefresh;
   if (savedExpiresAt) accessTokenExpiresAt = savedExpiresAt;
+  if (savedUpdatedAt) accessTokenUpdatedAt = savedUpdatedAt;
 
   if (accessToken) {
     tokenNeedsReconnect = false;
@@ -121,31 +136,71 @@ function applySavedTokenData(saved, sourceLabel) {
   return false;
 }
 
+function readTokenFileData() {
+  try {
+    if (!fs.existsSync(TOKEN_FILE)) return null;
+    return JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+  } catch (error) {
+    console.log("Could not read saved Upstox token file:", error.message);
+    return null;
+  }
+}
+
 async function loadSavedAccessToken() {
+  const tokenFileData = readTokenFileData();
+  const fileAccess = tokenFileData?.access_token || tokenFileData?.accessToken;
+  if (fileAccess) memoryBackupAccessToken = fileAccess;
+
   try {
     if (tokenCollection) {
       const saved = await tokenCollection.findOne({ _id: TOKEN_DOC_ID });
       if (applySavedTokenData(saved, "MongoDB")) return;
     }
   } catch (error) {
+    mongoLastError = error.message;
     console.log("Could not load Upstox token from MongoDB:", error.message);
   }
 
-  try {
-    if (fs.existsSync(TOKEN_FILE)) {
-      const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
-      if (applySavedTokenData(saved, "token file")) return;
-    }
-  } catch (error) {
-    console.log("Could not load saved Upstox token file:", error.message);
+  if (renderEnvAccessToken && renderEnvAccessToken !== "0") {
+    accessToken = renderEnvAccessToken;
+    activeTokenSource = "render-env-backup";
+    tokenNeedsReconnect = false;
+    tokenLastError = null;
+    console.log("MongoDB unavailable. Using Upstox token from Render environment backup.");
+    return;
+  }
+
+  if (tokenFileData && applySavedTokenData(tokenFileData, "token file")) {
+    activeTokenSource = "server-memory-backup";
+    return;
   }
 
   if (accessToken) {
+    memoryBackupAccessToken = accessToken;
     tokenNeedsReconnect = false;
     tokenLastError = null;
     tokenAutoRefreshEnabled = Boolean(refreshToken);
-    console.log(`Using Upstox token from Render environment as fallback. Auto refresh: ${tokenAutoRefreshEnabled ? "enabled" : "not available"}.`);
+    console.log(`Using Upstox token from ${activeTokenSource}. Auto refresh: ${tokenAutoRefreshEnabled ? "enabled" : "not available"}.`);
   }
+}
+
+function getMongoFallbackMessage() {
+  if (tokenCollection) return null;
+  if (activeTokenSource === "render-env-backup") return "mangodb gets disconnected and using token value by render";
+  return "mangodb gets disconnected and token is not updated on render";
+}
+
+function tryMemoryTokenFallback() {
+  if (tokenCollection) return false;
+  if (activeTokenSource !== "render-env-backup") return false;
+  if (!memoryBackupAccessToken || memoryBackupAccessToken === accessToken) return false;
+  accessToken = memoryBackupAccessToken;
+  activeTokenSource = "server-memory-backup";
+  tokenNeedsReconnect = false;
+  tokenLastError = null;
+  latestRates.status = "Render backup token failed. Trying latest token from server memory.";
+  console.log(latestRates.status);
+  return true;
 }
 
 function buildTokenExpiry(tokenData) {
@@ -163,11 +218,16 @@ function buildTokenExpiry(tokenData) {
 
 async function saveAccessToken(tokenData) {
   accessToken = tokenData.access_token || tokenData.accessToken || accessToken;
+  if (accessToken) {
+    memoryBackupAccessToken = accessToken;
+    activeTokenSource = tokenCollection ? "mongodb" : "server-memory-backup";
+  }
   refreshToken = tokenData.refresh_token || tokenData.refreshToken || refreshToken;
   accessTokenExpiresAt = buildTokenExpiry(tokenData);
   tokenNeedsReconnect = false;
   tokenLastError = null;
   tokenAutoRefreshEnabled = Boolean(refreshToken);
+  accessTokenUpdatedAt = new Date().toISOString();
 
   const dataToSave = {
     ...tokenData,
@@ -175,8 +235,8 @@ async function saveAccessToken(tokenData) {
     refresh_token: refreshToken,
     expires_at: accessTokenExpiresAt,
     autoRefreshEnabled: tokenAutoRefreshEnabled,
-    savedAt: new Date().toISOString(),
-    updatedAt: new Date(),
+    savedAt: accessTokenUpdatedAt,
+    updatedAt: accessTokenUpdatedAt,
   };
 
   try {
@@ -397,19 +457,32 @@ async function getAutoKeys() {
   const json = zlib.gunzipSync(res.data).toString("utf8");
   const instruments = JSON.parse(json);
 
-  const now = Date.now();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
   const fiveDaysMs = 5 * 24 * 60 * 60 * 1000;
-  const minimumAllowedExpiry = now + fiveDaysMs;
+  // Contract expiring within next 5 calendar days is skipped.
+  // Example: on 1 June 2026, a 5 June 2026 expiry is skipped and the next available expiry is selected.
+  const minimumAllowedExpiry = today.getTime() + fiveDaysMs;
+
+  function expiryTime(x) {
+    const raw = x?.expiry;
+    const n = Number(raw);
+    if (Number.isFinite(n)) {
+      // Upstox complete file generally uses milliseconds, but handle seconds also.
+      return n < 100000000000 ? n * 1000 : n;
+    }
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
 
   function find(symbol) {
     return instruments
-      .filter((x) =>
-        x.segment === "MCX_FO" &&
-        x.instrument_type === "FUT" &&
-        x.asset_symbol === symbol &&
-        Number(x.expiry) > minimumAllowedExpiry
-      )
-      .sort((a, b) => Number(a.expiry) - Number(b.expiry))[0];
+      .filter((x) => {
+        const asset = String(x.asset_symbol || x.underlying_symbol || x.name || x.trading_symbol || "").toUpperCase();
+        const type = String(x.instrument_type || x.instrumentType || "").toUpperCase();
+        return x.segment === "MCX_FO" && type.includes("FUT") && asset.includes(symbol) && expiryTime(x) > minimumAllowedExpiry;
+      })
+      .sort((a, b) => expiryTime(a) - expiryTime(b))[0];
   }
 
   const gold = find("GOLD");
@@ -426,11 +499,17 @@ async function prepareInstrumentKeys() {
   try {
     const autoKeys = await getAutoKeys();
 
-    GOLD_KEY = process.env.MANUAL_GOLD_KEY || autoKeys.gold.instrument_key;
-    SILVER_KEY = process.env.MANUAL_SILVER_KEY || autoKeys.silver.instrument_key;
+    const autoDetectEnabled = String(process.env.AUTO_DETECT_KEYS || "true").toLowerCase() !== "false";
+    GOLD_KEY = autoDetectEnabled ? autoKeys.gold.instrument_key : (process.env.MANUAL_GOLD_KEY || autoKeys.gold.instrument_key);
+    SILVER_KEY = autoDetectEnabled ? autoKeys.silver.instrument_key : (process.env.MANUAL_SILVER_KEY || autoKeys.silver.instrument_key);
 
-    console.log("Using GOLD:", autoKeys.gold.trading_symbol, GOLD_KEY);
-    console.log("Using SILVER:", autoKeys.silver.trading_symbol, SILVER_KEY);
+    latestRates.goldContract = autoKeys.gold.trading_symbol || autoKeys.gold.name || "GOLD FUT";
+    latestRates.silverContract = autoKeys.silver.trading_symbol || autoKeys.silver.name || "SILVER FUT";
+    latestRates.goldContractExpiry = autoKeys.gold.expiry || null;
+    latestRates.silverContractExpiry = autoKeys.silver.expiry || null;
+
+    console.log("Using GOLD:", latestRates.goldContract, GOLD_KEY);
+    console.log("Using SILVER:", latestRates.silverContract, SILVER_KEY);
 
     latestRates.status = "Instrument keys loaded successfully. Contracts expiring within next 5 days are skipped.";
   } catch (error) {
@@ -472,6 +551,8 @@ function calculateRates(goldMcx, silverMcx) {
 
     goldDifference: gDiff,
     silverDifference: sDiff,
+    goldDifferenceUpdatedAt,
+    silverDifferenceUpdatedAt,
 
     gold24k,
     gold22k: gold24k != null ? gold24k * 0.916 : null,
@@ -493,11 +574,17 @@ function calculateRates(goldMcx, silverMcx) {
     lastAutoRefreshAt,
     reconnectPath: tokenNeedsReconnect ? "/upstox" : null,
     mongoConnected: Boolean(tokenCollection),
-    tokenStorage: tokenCollection ? "mongodb" : (fs.existsSync(TOKEN_FILE) ? "file" : (accessToken ? "render-env-backup" : "none")),
-    usingRenderBackupToken: !tokenCollection && Boolean(accessToken),
-    mongoWarning: !tokenCollection ? "MongoDB disconnected. Using backup access token from server." : null,
+    tokenStorage: activeTokenSource,
+    usingRenderBackupToken: activeTokenSource === "render-env-backup",
+    usingMemoryBackupToken: activeTokenSource === "server-memory-backup",
+    mongoWarning: getMongoFallbackMessage(),
+    mongoLastError,
     goldInstrumentKey: GOLD_KEY,
     silverInstrumentKey: SILVER_KEY,
+    goldContract: latestRates.goldContract || null,
+    silverContract: latestRates.silverContract || null,
+    goldContractExpiry: latestRates.goldContractExpiry || null,
+    silverContractExpiry: latestRates.silverContractExpiry || null,
   };
 }
 
@@ -606,6 +693,7 @@ async function fetchLastAvailableQuotes() {
     const msg = error.response?.data?.errors?.[0]?.message || error.response?.data?.message || error.message;
     console.log("Last quote fallback failed:", error.response?.data || error.message);
     if (String(msg).toLowerCase().includes("token") || error.response?.status === 401 || error.response?.status === 403) {
+      if (tryMemoryTokenFallback()) return fetchLastAvailableQuotes();
       const refreshed = await refreshAccessTokenIfPossible(true);
       if (refreshed) return fetchLastAvailableQuotes();
       markTokenReconnectNeeded("Upstox access token expired/invalid and auto refresh is unavailable. Open /upstox once.");
@@ -629,6 +717,12 @@ async function getAuthorizedWebSocketUrl() {
     return response.data.data.authorized_redirect_uri;
   } catch (error) {
     if (error.response?.status === 401 || error.response?.status === 403) {
+      if (tryMemoryTokenFallback()) {
+        const response = await axios.get(UPSTOX_AUTHORIZE_URL, {
+          headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+        });
+        return response.data.data.authorized_redirect_uri;
+      }
       const refreshed = await refreshAccessTokenIfPossible(true);
       if (refreshed) {
         const response = await axios.get(UPSTOX_AUTHORIZE_URL, {
@@ -812,6 +906,19 @@ app.post("/api/upstox/manual-token", async (req, res) => {
   res.json({ ok: true, savedToMongoDB: Boolean(tokenCollection), savedToServerFile: true, renderEnvironment: renderUpdate, accessTokenExpiresAt });
 });
 
+
+app.get("/api/upstox/current-token", (req, res) => {
+  res.json({
+    ok: Boolean(accessToken),
+    accessToken: accessToken || "",
+    updatedAt: accessTokenUpdatedAt || accessTokenExpiresAt || null,
+    accessTokenExpiresAt,
+    tokenStorage: activeTokenSource,
+    mongoConnected: Boolean(tokenCollection),
+    mongoWarning: getMongoFallbackMessage(),
+  });
+});
+
 app.get("/api/upstox/status", (req, res) => {
   res.json({
     hasApiKey: Boolean(UPSTOX_API_KEY),
@@ -821,8 +928,12 @@ app.get("/api/upstox/status", (req, res) => {
     tokenLastError,
     loginUrl: UPSTOX_API_KEY ? getUpstoxLoginUrl(req) : null,
     redirectUri: getRedirectUri(req),
-    tokenStorage: tokenCollection ? "mongodb" : (fs.existsSync(TOKEN_FILE) ? "file" : (accessToken ? "env" : "none")),
+    tokenStorage: activeTokenSource,
     mongoConnected: Boolean(tokenCollection),
+    mongoWarning: getMongoFallbackMessage(),
+    mongoLastError,
+    usingRenderBackupToken: activeTokenSource === "render-env-backup",
+    usingMemoryBackupToken: activeTokenSource === "server-memory-backup",
     refreshTokenPresent: Boolean(refreshToken),
     tokenAutoRefreshEnabled,
     accessTokenExpiresAt,
@@ -922,10 +1033,11 @@ app.post("/api/rate-difference", (req, res) => {
   const goldDiff = Number(req.body.goldDifference);
   const silverDiff = Number(req.body.silverDifference);
 
-  if (hasGold && Number.isFinite(goldDiff)) goldDifference = goldDiff;
-  if (hasSilver && Number.isFinite(silverDiff)) silverDifference = silverDiff;
+  const nowIso = new Date().toISOString();
+  if (hasGold && Number.isFinite(goldDiff)) { goldDifference = goldDiff; goldDifferenceUpdatedAt = nowIso; }
+  if (hasSilver && Number.isFinite(silverDiff)) { silverDifference = silverDiff; silverDifferenceUpdatedAt = nowIso; }
 
-  latestRates.lastUpdated = new Date().toISOString();
+  latestRates.lastUpdated = nowIso;
   latestRates.status = "Metal rate difference updated.";
   broadcast();
 
@@ -937,7 +1049,13 @@ async function startServer() {
   await loadSavedAccessToken();
   await prepareInstrumentKeys();
   fetchLastAvailableQuotes();
-  setInterval(fetchLastAvailableQuotes, 5 * 60 * 1000);
+  setInterval(fetchLastAvailableQuotes, 60 * 1000);
+  setInterval(async () => {
+    await prepareInstrumentKeys();
+    await fetchLastAvailableQuotes();
+    try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
+    setTimeout(connectUpstox, 1000);
+  }, 60 * 60 * 1000);
   const httpServer = app.listen(PORT, () => {
     console.log(`Backend running at http://localhost:${PORT}`);
     connectUpstox();
