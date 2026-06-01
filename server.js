@@ -475,13 +475,46 @@ async function getAutoKeys() {
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
+  function normalizeText(value) {
+    return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  }
+
+  function isMainCommodityFuture(x, symbol) {
+    const segment = String(x.segment || x.exchange_segment || "").toUpperCase();
+    const type = String(x.instrument_type || x.instrumentType || "").toUpperCase();
+    const assetSymbol = normalizeText(x.asset_symbol || x.underlying_symbol || x.underlying);
+    const name = normalizeText(x.name);
+    const tradingSymbol = normalizeText(x.trading_symbol || x.tradingsymbol || x.symbol);
+
+    // Only MCX futures. This rejects NSE/BSE commodities and all options/call/put instruments.
+    if (segment !== "MCX_FO") return false;
+    if (!type.includes("FUT")) return false;
+    if (type.includes("OPT") || tradingSymbol.includes("CE") || tradingSymbol.includes("PE")) return false;
+
+    // Strictly select only main GOLD and main SILVER contracts.
+    // This rejects GOLDM, GOLDMINI, GOLDGUINEA, GOLDPETAL, GOLDTEN,
+    // SILVERM, SILVERMINI, SILVERMIC, SILVERMICRO, SILVER100, SILVER1000, etc.
+    const rejected = /(GOLDM|GOLDMINI|GOLDGUINEA|GOLDPETAL|GOLDTEN|SILVERM|SILVERMINI|SILVERMIC|SILVERMICRO|SILVER100|SILVER1000|OPTION|OPT|CALL|PUT)/;
+    if (rejected.test(tradingSymbol) || rejected.test(name) || rejected.test(assetSymbol)) return false;
+
+    if (symbol === "GOLD") {
+      if (assetSymbol && assetSymbol !== "GOLD") return false;
+      if (name && name !== "GOLD" && !name.startsWith("GOLD")) return false;
+      return tradingSymbol === "GOLD" || /^GOLD\d{2}[A-Z]{3}FUT$/.test(tradingSymbol) || /^GOLD[A-Z]{3}\d{2}FUT$/.test(tradingSymbol);
+    }
+
+    if (symbol === "SILVER") {
+      if (assetSymbol && assetSymbol !== "SILVER") return false;
+      if (name && name !== "SILVER" && !name.startsWith("SILVER")) return false;
+      return tradingSymbol === "SILVER" || /^SILVER\d{2}[A-Z]{3}FUT$/.test(tradingSymbol) || /^SILVER[A-Z]{3}\d{2}FUT$/.test(tradingSymbol);
+    }
+
+    return false;
+  }
+
   function find(symbol) {
     return instruments
-      .filter((x) => {
-        const asset = String(x.asset_symbol || x.underlying_symbol || x.name || x.trading_symbol || "").toUpperCase();
-        const type = String(x.instrument_type || x.instrumentType || "").toUpperCase();
-        return x.segment === "MCX_FO" && type.includes("FUT") && asset.includes(symbol) && expiryTime(x) > minimumAllowedExpiry;
-      })
+      .filter((x) => isMainCommodityFuture(x, symbol) && expiryTime(x) > minimumAllowedExpiry)
       .sort((a, b) => expiryTime(a) - expiryTime(b))[0];
   }
 
