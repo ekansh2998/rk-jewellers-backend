@@ -453,24 +453,42 @@ function decodeUpstoxBinaryFeed(buffer) {
 async function getAutoKeys() {
   const url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz";
 
-  const res = await axios.get(url, { responseType: "arraybuffer" });
+  const res = await axios.get(url, { responseType: "arraybuffer", timeout: 30000 });
   const json = zlib.gunzipSync(res.data).toString("utf8");
   const instruments = JSON.parse(json);
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const fiveDaysMs = 5 * 24 * 60 * 60 * 1000;
-  // Contract expiring within next 5 calendar days is skipped.
-  // Example: on 1 June 2026, a 5 June 2026 expiry is skipped and the next available expiry is selected.
+  // Any contract expiring in the next 5 calendar days must be skipped.
+  // Example: 1 June 2026 + 5-day buffer means 5 June 2026 expiry is skipped.
   const minimumAllowedExpiry = today.getTime() + fiveDaysMs;
 
+  function parseYYYYMMDD(value) {
+    const text = String(value || "").trim();
+    if (!/^\d{8}$/.test(text)) return 0;
+    const y = Number(text.slice(0, 4));
+    const m = Number(text.slice(4, 6)) - 1;
+    const d = Number(text.slice(6, 8));
+    const t = new Date(y, m, d).getTime();
+    return Number.isFinite(t) ? t : 0;
+  }
+
   function expiryTime(x) {
-    const raw = x?.expiry;
+    const raw = x?.expiry || x?.expiry_date || x?.expiryDate || x?.contract_expiry;
+    const ymd = parseYYYYMMDD(raw);
+    if (ymd) return ymd;
+
     const n = Number(raw);
-    if (Number.isFinite(n)) {
-      // Upstox complete file generally uses milliseconds, but handle seconds also.
-      return n < 100000000000 ? n * 1000 : n;
+    if (Number.isFinite(n) && n > 0) {
+      const digits = String(Math.trunc(n)).length;
+      if (digits === 8) return parseYYYYMMDD(String(Math.trunc(n)));
+      if (digits <= 10) return n * 1000;       // seconds
+      if (digits <= 13) return n;              // milliseconds
+      if (digits <= 16) return Math.floor(n / 1000); // microseconds
+      return Math.floor(n / 1000000);          // nanoseconds
     }
+
     const parsed = Date.parse(raw);
     return Number.isFinite(parsed) ? parsed : 0;
   }
@@ -479,84 +497,122 @@ async function getAutoKeys() {
     return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   }
 
+  function textPack(x) {
+    return [
+      x.trading_symbol, x.tradingsymbol, x.symbol, x.name,
+      x.asset_symbol, x.underlying_symbol, x.underlying, x.instrument_type,
+      x.instrumentType, x.segment, x.exchange_segment, x.exchange
+    ].map(normalizeText).join("|");
+  }
+
   function isMainCommodityFuture(x, symbol) {
-    const segment = String(x.segment || x.exchange_segment || "").toUpperCase();
-    const type = String(x.instrument_type || x.instrumentType || "").toUpperCase();
-    const assetSymbol = normalizeText(x.asset_symbol || x.underlying_symbol || x.underlying);
-    const name = normalizeText(x.name);
-    const tradingSymbol = normalizeText(x.trading_symbol || x.tradingsymbol || x.symbol);
+    const segment = String(x.segment || x.exchange_segment || x.exchange || "").toUpperCase();
+    const type = String(x.instrument_type || x.instrumentType || x.instrument_type_name || "").toUpperCase();
+    const assetSymbol = normalizeText(x.asset_symbol || x.underlying_symbol || x.underlying || x.assetSymbol);
+    const name = normalizeText(x.name || x.instrument_name);
+    const tradingSymbol = normalizeText(x.trading_symbol || x.tradingsymbol || x.symbol || x.tradingSymbol);
+    const pack = textPack(x);
 
-    // Only MCX futures. This rejects NSE/BSE commodities and all options/call/put instruments.
-    if (segment !== "MCX_FO") return false;
-    if (!type.includes("FUT")) return false;
-    if (type.includes("OPT") || tradingSymbol.includes("CE") || tradingSymbol.includes("PE")) return false;
+    // Only MCX futures. Reject NSE/BSE, options, call-put and non-futures.
+    if (!segment.includes("MCX")) return false;
+    if (!(type.includes("FUT") || pack.includes("FUT"))) return false;
+    if (type.includes("OPT") || pack.includes("OPTION") || /(^|\|)[A-Z0-9]*(CE|PE)(\||$)/.test(pack)) return false;
 
-    // Strictly select only main GOLD and main SILVER contracts.
-    // This rejects GOLDM, GOLDMINI, GOLDGUINEA, GOLDPETAL, GOLDTEN,
-    // SILVERM, SILVERMINI, SILVERMIC, SILVERMICRO, SILVER100, SILVER1000, etc.
-    const rejected = /(GOLDM|GOLDMINI|GOLDGUINEA|GOLDPETAL|GOLDTEN|SILVERM|SILVERMINI|SILVERMIC|SILVERMICRO|SILVER100|SILVER1000|OPTION|OPT|CALL|PUT)/;
-    if (rejected.test(tradingSymbol) || rejected.test(name) || rejected.test(assetSymbol)) return false;
+    // Reject all non-main bullion contracts.
+    const rejectedWords = [
+      "GOLDM", "GOLDMINI", "GOLDGUINEA", "GOLDPETAL", "GOLDTEN",
+      "SILVERM", "SILVERMINI", "SILVERMIC", "SILVERMICRO", "SILVER100", "SILVER1000",
+      "MINI", "MICRO", "PETAL", "GUINEA", "TEN", "1000"
+    ];
+    if (rejectedWords.some((word) => pack.includes(word))) return false;
 
     if (symbol === "GOLD") {
       if (assetSymbol && assetSymbol !== "GOLD") return false;
-      if (name && name !== "GOLD" && !name.startsWith("GOLD")) return false;
-      return tradingSymbol === "GOLD" || /^GOLD\d{2}[A-Z]{3}FUT$/.test(tradingSymbol) || /^GOLD[A-Z]{3}\d{2}FUT$/.test(tradingSymbol);
+      if (!assetSymbol && !tradingSymbol.startsWith("GOLD") && !name.startsWith("GOLD")) return false;
+      return true;
     }
 
     if (symbol === "SILVER") {
       if (assetSymbol && assetSymbol !== "SILVER") return false;
-      if (name && name !== "SILVER" && !name.startsWith("SILVER")) return false;
-      return tradingSymbol === "SILVER" || /^SILVER\d{2}[A-Z]{3}FUT$/.test(tradingSymbol) || /^SILVER[A-Z]{3}\d{2}FUT$/.test(tradingSymbol);
+      if (!assetSymbol && !tradingSymbol.startsWith("SILVER") && !name.startsWith("SILVER")) return false;
+      return true;
     }
 
     return false;
   }
 
   function find(symbol) {
-    return instruments
-      .filter((x) => isMainCommodityFuture(x, symbol) && expiryTime(x) > minimumAllowedExpiry)
-      .sort((a, b) => expiryTime(a) - expiryTime(b))[0];
+    const matches = instruments
+      .filter((x) => isMainCommodityFuture(x, symbol))
+      .map((x) => ({ ...x, __expiryTime: expiryTime(x) }))
+      .filter((x) => x.__expiryTime > minimumAllowedExpiry)
+      .sort((a, b) => a.__expiryTime - b.__expiryTime);
+
+    if (!matches.length) {
+      const sample = instruments
+        .filter((x) => String(x.segment || x.exchange_segment || x.exchange || "").toUpperCase().includes("MCX"))
+        .filter((x) => textPack(x).includes(symbol))
+        .slice(0, 5)
+        .map((x) => ({ trading_symbol: x.trading_symbol || x.tradingsymbol || x.symbol, name: x.name, type: x.instrument_type || x.instrumentType, expiry: x.expiry, key: x.instrument_key }))
+        .filter(Boolean);
+      console.log(`No valid main ${symbol} future found after 5-day rollover filter. Sample:`, sample);
+      return null;
+    }
+
+    return matches[0];
   }
 
   const gold = find("GOLD");
   const silver = find("SILVER");
 
   if (!gold || !silver) {
-    throw new Error("Could not find active MCX GOLD/SILVER futures after applying 5-day expiry skip rule.");
+    throw new Error("Could not find active main MCX GOLD/SILVER futures after applying 5-day expiry skip rule.");
   }
 
   return { gold, silver };
 }
 
 async function prepareInstrumentKeys() {
+  const autoDetectEnabled = String(process.env.AUTO_DETECT_KEYS || "true").toLowerCase() !== "false";
   try {
     const autoKeys = await getAutoKeys();
 
-    const autoDetectEnabled = String(process.env.AUTO_DETECT_KEYS || "true").toLowerCase() !== "false";
     GOLD_KEY = autoDetectEnabled ? autoKeys.gold.instrument_key : (process.env.MANUAL_GOLD_KEY || autoKeys.gold.instrument_key);
     SILVER_KEY = autoDetectEnabled ? autoKeys.silver.instrument_key : (process.env.MANUAL_SILVER_KEY || autoKeys.silver.instrument_key);
 
-    latestRates.goldContract = autoKeys.gold.trading_symbol || autoKeys.gold.name || "GOLD FUT";
-    latestRates.silverContract = autoKeys.silver.trading_symbol || autoKeys.silver.name || "SILVER FUT";
-    latestRates.goldContractExpiry = autoKeys.gold.expiry || null;
-    latestRates.silverContractExpiry = autoKeys.silver.expiry || null;
+    latestRates.goldContract = autoKeys.gold.trading_symbol || autoKeys.gold.tradingsymbol || autoKeys.gold.symbol || autoKeys.gold.name || "GOLD FUT";
+    latestRates.silverContract = autoKeys.silver.trading_symbol || autoKeys.silver.tradingsymbol || autoKeys.silver.symbol || autoKeys.silver.name || "SILVER FUT";
+    latestRates.goldContractExpiry = autoKeys.gold.expiry || autoKeys.gold.expiry_date || autoKeys.gold.expiryDate || null;
+    latestRates.silverContractExpiry = autoKeys.silver.expiry || autoKeys.silver.expiry_date || autoKeys.silver.expiryDate || null;
 
-    console.log("Using GOLD:", latestRates.goldContract, GOLD_KEY);
-    console.log("Using SILVER:", latestRates.silverContract, SILVER_KEY);
+    console.log("Using main MCX GOLD contract:", latestRates.goldContract, GOLD_KEY, "expiry:", latestRates.goldContractExpiry);
+    console.log("Using main MCX SILVER contract:", latestRates.silverContract, SILVER_KEY, "expiry:", latestRates.silverContractExpiry);
 
-    latestRates.status = "Instrument keys loaded successfully. Contracts expiring within next 5 days are skipped.";
+    latestRates.status = "Main MCX GOLD/SILVER contracts loaded. Contracts expiring within next 5 days are skipped.";
   } catch (error) {
-    GOLD_KEY = process.env.MANUAL_GOLD_KEY || process.env.GOLD_INSTRUMENT_KEY || null;
-    SILVER_KEY = process.env.MANUAL_SILVER_KEY || process.env.SILVER_INSTRUMENT_KEY || null;
+    console.log("Auto key download/selection failed:", error.message);
 
-    console.log("Auto key download failed:", error.message);
-
-    if (GOLD_KEY && SILVER_KEY) {
-      console.log("Using manual keys.");
-      latestRates.status = "Auto key download failed. Using manual instrument keys.";
-    } else {
-      latestRates.status = "Auto key download failed and manual keys are missing.";
+    if (!autoDetectEnabled) {
+      GOLD_KEY = process.env.MANUAL_GOLD_KEY || process.env.GOLD_INSTRUMENT_KEY || null;
+      SILVER_KEY = process.env.MANUAL_SILVER_KEY || process.env.SILVER_INSTRUMENT_KEY || null;
+      latestRates.goldContract = null;
+      latestRates.silverContract = null;
+      latestRates.goldContractExpiry = null;
+      latestRates.silverContractExpiry = null;
+      latestRates.status = GOLD_KEY && SILVER_KEY
+        ? "Auto-detect disabled. Using manual instrument keys from Render."
+        : "Auto-detect disabled and manual keys are missing.";
+      return;
     }
+
+    // When auto-detect is enabled, do not silently use old manual keys, because that can keep an expiring/wrong contract active.
+    GOLD_KEY = null;
+    SILVER_KEY = null;
+    latestRates.goldContract = null;
+    latestRates.silverContract = null;
+    latestRates.goldContractExpiry = null;
+    latestRates.silverContractExpiry = null;
+    latestRates.status = "Could not auto-select main MCX GOLD/SILVER contracts. Check Upstox instrument master/API token.";
   }
 }
 
@@ -1028,7 +1084,10 @@ app.get("/rates", (req, res) => {
   res.redirect("/api/rates");
 });
 
-app.get("/api/rates", (req, res) => {
+app.get("/api/rates", async (req, res) => {
+  if (!GOLD_KEY || !SILVER_KEY) {
+    await prepareInstrumentKeys();
+  }
   res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
 });
 
@@ -1082,13 +1141,13 @@ async function startServer() {
   await loadSavedAccessToken();
   await prepareInstrumentKeys();
   fetchLastAvailableQuotes();
-  setInterval(fetchLastAvailableQuotes, 60 * 1000);
+  setInterval(fetchLastAvailableQuotes, 1000);
   setInterval(async () => {
     await prepareInstrumentKeys();
     await fetchLastAvailableQuotes();
     try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
     setTimeout(connectUpstox, 1000);
-  }, 60 * 60 * 1000);
+  }, 15 * 60 * 1000);
   const httpServer = app.listen(PORT, () => {
     console.log(`Backend running at http://localhost:${PORT}`);
     connectUpstox();
