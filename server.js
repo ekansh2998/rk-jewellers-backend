@@ -986,30 +986,85 @@ app.get("/upstox", (req, res) => {
   res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Reconnect Upstox</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px;line-height:1.45}.card{max-width:720px;margin:auto;background:#1d1d1d;border:1px solid #444;border-radius:18px;padding:24px}a.btn{display:inline-block;background:#d4af37;color:#111;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:700}.warn{color:#ffd36a}.ok{color:#74ff8a}code{background:#000;padding:2px 5px;border-radius:5px}</style></head><body><div class="card"><h1>R K Jewellers - Upstox Reconnect</h1><p>Status: <b>${tokenNeedsReconnect ? '<span class="warn">Reconnect required</span>' : '<span class="ok">Token present</span>'}</b></p><p>${tokenLastError || latestRates.status || ''}</p>${ready ? `<p><a class="btn" href="${loginUrl}">Reconnect Upstox Now</a></p>` : `<p class="warn">Missing environment variables. Add <code>UPSTOX_API_KEY</code>, <code>UPSTOX_API_SECRET</code>, and optionally <code>UPSTOX_REDIRECT_URI</code> in Render.</p>`}<p>Redirect URI to add in Upstox app settings:</p><p><code>${getRedirectUri(req)}</code></p><p>After reconnect, the backend will save the new access token and expiry time in MongoDB/server storage. Upstox reconnect is still available because refresh-token auto renewal is not supported in this setup.</p><p>After reconnect, open <code>/api/rates</code> again.</p></div></body></html>`);
 });
 
-async function updateRenderAccessTokenEnv(newToken) {
+async function updateRenderEnvironmentVariable(envKey, envValue) {
   const apiKey = process.env.RENDER_API_KEY || process.env.RENDER_TOKEN || "";
   const serviceId = process.env.RENDER_SERVICE_ID || "";
-  const envKey = process.env.RENDER_ACCESS_TOKEN_ENV_KEY || "UPSTOX_ACCESS_TOKEN";
   if (!apiKey || !serviceId) {
-    return { updated: false, reason: "Render API key/service id not configured. Token saved in MongoDB/file/server memory." };
+    return { updated: false, reason: "RENDER_API_KEY or RENDER_SERVICE_ID missing. Value saved in MongoDB/server memory only." };
   }
+
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+
+  const baseUrl = `https://api.render.com/v1/services/${serviceId}/env-vars`;
+  const value = String(envValue ?? "");
+
+  const attempts = [];
   try {
-    // Best-effort Render API update. If Render changes this API, MongoDB storage still works.
-    const listUrl = `https://api.render.com/v1/services/${serviceId}/env-vars`;
-    const headers = { Authorization: `Bearer ${apiKey}`, Accept: "application/json", "Content-Type": "application/json" };
-    const list = await axios.get(listUrl, { headers, timeout: 15000 });
-    const found = Array.isArray(list.data) ? list.data.find(x => x?.envVar?.key === envKey || x?.key === envKey) : null;
-    if (found?.envVar?.id || found?.id) {
-      const id = found.envVar?.id || found.id;
-      await axios.patch(`${listUrl}/${id}`, { value: newToken }, { headers, timeout: 15000 });
-    } else {
-      await axios.post(listUrl, { key: envKey, value: newToken }, { headers, timeout: 15000 });
+    const list = await axios.get(baseUrl, { headers, timeout: 15000 });
+    const rows = Array.isArray(list.data) ? list.data : (Array.isArray(list.data?.envVars) ? list.data.envVars : []);
+    const found = rows.find(x =>
+      x?.envVar?.key === envKey ||
+      x?.key === envKey ||
+      x?.envVarKey === envKey ||
+      x?.name === envKey
+    );
+    const id = found?.envVar?.id || found?.id || found?.envVarId || null;
+
+    if (id) {
+      const patchBodies = [
+        { value },
+        { envVar: { value } },
+        { key: envKey, value },
+        { envVar: { key: envKey, value } },
+      ];
+      for (const body of patchBodies) {
+        try {
+          await axios.patch(`${baseUrl}/${id}`, body, { headers, timeout: 15000 });
+          process.env[envKey] = value;
+          return { updated: true, method: "patch-by-id" };
+        } catch (err) {
+          attempts.push(`patch-by-id: ${err.response?.status || err.message}`);
+        }
+      }
     }
-    return { updated: true };
+
+    // Some Render API versions identify env vars by key instead of id.
+    for (const method of ["patch", "put"]) {
+      for (const body of [{ value }, { key: envKey, value }, { envVar: { key: envKey, value } }]) {
+        try {
+          await axios({ method, url: `${baseUrl}/${encodeURIComponent(envKey)}`, data: body, headers, timeout: 15000 });
+          process.env[envKey] = value;
+          return { updated: true, method: `${method}-by-key` };
+        } catch (err) {
+          attempts.push(`${method}-by-key: ${err.response?.status || err.message}`);
+        }
+      }
+    }
+
+    // Create if not found / if update endpoints fail.
+    try {
+      await axios.post(baseUrl, { key: envKey, value }, { headers, timeout: 15000 });
+      process.env[envKey] = value;
+      return { updated: true, method: "post-create" };
+    } catch (err) {
+      attempts.push(`post-create: ${err.response?.status || err.message}`);
+    }
+
+    return { updated: false, reason: attempts.join(" | ") || "Render API did not accept update." };
   } catch (error) {
     return { updated: false, reason: error.response?.data || error.message };
   }
 }
+
+async function updateRenderAccessTokenEnv(newToken) {
+  const envKey = process.env.RENDER_ACCESS_TOKEN_ENV_KEY || "UPSTOX_ACCESS_TOKEN";
+  return updateRenderEnvironmentVariable(envKey, newToken);
+}
+
 
 app.post("/api/upstox/manual-token", async (req, res) => {
   const token = String(req.body?.accessToken || "").trim();
@@ -1149,21 +1204,34 @@ app.post("/api/manual-rates", (req, res) => {
   res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
 });
 
-app.post("/api/rate-difference", (req, res) => {
+app.post("/api/rate-difference", async (req, res) => {
   const hasGold = Object.prototype.hasOwnProperty.call(req.body, "goldDifference");
   const hasSilver = Object.prototype.hasOwnProperty.call(req.body, "silverDifference");
   const goldDiff = Number(req.body.goldDifference);
   const silverDiff = Number(req.body.silverDifference);
 
   const nowIso = new Date().toISOString();
-  if (hasGold && Number.isFinite(goldDiff)) { goldDifference = goldDiff; goldDifferenceUpdatedAt = nowIso; }
-  if (hasSilver && Number.isFinite(silverDiff)) { silverDifference = silverDiff; silverDifferenceUpdatedAt = nowIso; }
+  const renderUpdates = {};
+  if (hasGold && Number.isFinite(goldDiff)) {
+    goldDifference = goldDiff;
+    goldDifferenceUpdatedAt = nowIso;
+    renderUpdates.goldDifference = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE", String(goldDiff));
+    renderUpdates.goldDifferenceUpdatedAt = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+  }
+  if (hasSilver && Number.isFinite(silverDiff)) {
+    silverDifference = silverDiff;
+    silverDifferenceUpdatedAt = nowIso;
+    renderUpdates.silverDifference = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE", String(silverDiff));
+    renderUpdates.silverDifferenceUpdatedAt = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+  }
 
   latestRates.lastUpdated = nowIso;
   latestRates.status = "Metal rate difference updated.";
   broadcast();
 
-  res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
+  const result = calculateRates(latestRates.goldMcx, latestRates.silverMcx);
+  result.renderEnvironmentUpdates = renderUpdates;
+  res.json(result);
 });
 
 async function startServer() {
