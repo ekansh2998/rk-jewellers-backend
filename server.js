@@ -123,7 +123,9 @@ function applySavedTokenData(saved, sourceLabel) {
     activeTokenSource = sourceLabel === "MongoDB" ? "mongodb" : (sourceLabel === "Render environment" ? "render-env-backup" : "server-memory-backup");
   }
   if (savedRefresh) refreshToken = savedRefresh;
-  if (savedExpiresAt) accessTokenExpiresAt = savedExpiresAt;
+  const decodedSavedExpiry = decodeJwtExpiry(savedAccess);
+  if (decodedSavedExpiry) accessTokenExpiresAt = decodedSavedExpiry;
+  else if (savedExpiresAt) accessTokenExpiresAt = savedExpiresAt;
   if (savedUpdatedAt) accessTokenUpdatedAt = savedUpdatedAt;
 
   if (accessToken) {
@@ -203,16 +205,44 @@ function tryMemoryTokenFallback() {
   return true;
 }
 
-function buildTokenExpiry(tokenData) {
-  const rawExpiresAt = tokenData.expires_at || tokenData.expiresAt;
-  if (rawExpiresAt) return new Date(rawExpiresAt).toISOString();
+
+function decodeJwtExpiry(accessTokenValue) {
+  try {
+    const parts = String(accessTokenValue || "").split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
+    const decoded = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+    if (decoded && Number.isFinite(Number(decoded.exp))) {
+      return new Date(Number(decoded.exp) * 1000).toISOString();
+    }
+    if (decoded && Number.isFinite(Number(decoded.expires_at))) {
+      const raw = Number(decoded.expires_at);
+      return new Date(raw > 9999999999 ? raw : raw * 1000).toISOString();
+    }
+  } catch (error) {
+    console.log("Could not decode access token expiry:", error.message);
+  }
+  return null;
+}
+
+function buildTokenExpiry(tokenData = {}) {
+  const tokenValue = tokenData.access_token || tokenData.accessToken || accessToken;
+  const decodedExpiry = decodeJwtExpiry(tokenValue);
+  if (decodedExpiry) return decodedExpiry;
+
+  const rawExpiresAt = tokenData.expires_at || tokenData.expiresAt || tokenData.accessTokenExpiresAt;
+  if (rawExpiresAt) {
+    const parsed = new Date(rawExpiresAt);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  }
 
   const expiresInSeconds = Number(tokenData.expires_in || tokenData.expiresIn);
   if (Number.isFinite(expiresInSeconds) && expiresInSeconds > 0) {
     return new Date(Date.now() + expiresInSeconds * 1000).toISOString();
   }
 
-  // Safe fallback: many broker access tokens are short lived. Refresh once per day if no expiry is returned.
+  // Fallback only when Upstox does not return an expiry and token is not JWT-decodable.
   return new Date(Date.now() + 23 * 60 * 60 * 1000).toISOString();
 }
 
@@ -1068,7 +1098,7 @@ app.get("/api/upstox/callback", async (req, res) => {
     await fetchLastAvailableQuotes();
     setTimeout(connectUpstox, 1000);
 
-    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">Upstox connected successfully ✅</h1><p>You can close this page now.</p><p>The new access token has been saved in backend storage. You can now return to the app.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">Access token generated successfully</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
   } catch (error) {
     const details = JSON.stringify(error.response?.data || error.message);
     console.error("Upstox token exchange failed:", details);
