@@ -9,6 +9,7 @@ const protobuf = require("protobufjs");
 const fs = require("fs");
 const path = require("path");
 const { MongoClient } = require("mongodb");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
@@ -40,10 +41,21 @@ let mongoLastError = null;
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
 const UPSTOX_REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI || "";
+const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
+const ADMIN_UPDATE_PASSWORD = process.env.ADMIN_UPDATE_PASSWORD || "Widber";
+const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_JWT_SECRET || crypto.createHash("sha256").update(String(UPSTOX_API_SECRET || UPSTOX_API_KEY || "rk-jewellers-local-secret")).digest("hex");
+const JWT_EXPIRY_SECONDS = Number(process.env.JWT_EXPIRY_SECONDS || 60 * 60);
 
 let tokenNeedsReconnect = false;
 let tokenLastError = null;
 let currentUpstoxWs = null;
+let upstoxWsAlive = false;
+let upstoxWsConnecting = false;
+let lastWebSocketMessageAt = null;
+let lastWebSocketPongAt = null;
+let liveFeedStatus = "Not connected";
+let websocketReconnectCount = 0;
+let lastHeartbeatCheckAt = null;
 let tokenAutoRefreshEnabled = false; // intentionally disabled: Upstox refresh-token auto renewal is not supported here.
 
 // Metal rate difference from .env. You can keep blank/0 and control from frontend/API.
@@ -205,6 +217,53 @@ function tryMemoryTokenFallback() {
   return true;
 }
 
+
+function base64Url(input) {
+  return Buffer.from(JSON.stringify(input)).toString("base64url");
+}
+
+function signAdminJwt(payload) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "HS256", typ: "JWT" };
+  const body = { ...payload, iat: now, exp: now + JWT_EXPIRY_SECONDS };
+  const data = `${base64Url(header)}.${base64Url(body)}`;
+  const signature = crypto.createHmac("sha256", JWT_SECRET).update(data).digest("base64url");
+  return `${data}.${signature}`;
+}
+
+function verifyAdminJwt(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length !== 3) return null;
+    const data = `${parts[0]}.${parts[1]}`;
+    const expected = crypto.createHmac("sha256", JWT_SECRET).update(data).digest("base64url");
+    const actual = parts[2];
+    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual))) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    if (!payload.exp || Date.now() >= Number(payload.exp) * 1000) return null;
+    return payload;
+  } catch (error) {
+    return null;
+  }
+}
+
+function requireAdminJwt(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const payload = verifyAdminJwt(token);
+  if (!payload) return res.status(401).json({ ok: false, message: "Admin session expired or invalid. Enter password again." });
+  req.admin = payload;
+  next();
+}
+
+function markRenderTokenActiveIfPossible(renderUpdate) {
+  if (renderUpdate?.updated) {
+    activeTokenSource = "render-env-backup";
+    if (accessToken) process.env.UPSTOX_ACCESS_TOKEN = accessToken;
+  } else if (!tokenCollection && activeTokenSource !== "render-env-backup") {
+    activeTokenSource = "server-memory-backup";
+  }
+}
 
 function decodeJwtExpiry(accessTokenValue) {
   try {
@@ -685,6 +744,11 @@ function calculateRates(goldMcx, silverMcx) {
     lastUpdated: latestRates.lastUpdated,
     source: latestRates.source,
     status: latestRates.status,
+    liveFeedStatus,
+    lastWebSocketMessageAt,
+    lastWebSocketPongAt,
+    websocketReconnectCount,
+    lastHeartbeatCheckAt,
     tokenNeedsReconnect,
     tokenLastError,
     tokenAutoRefreshEnabled,
@@ -858,10 +922,13 @@ async function getAuthorizedWebSocketUrl() {
 }
 
 async function connectUpstox() {
+  if (upstoxWsConnecting) return;
+  upstoxWsConnecting = true;
   if (!accessToken || !GOLD_KEY || !SILVER_KEY) {
     latestRates.status = "Missing access token or instrument keys. Manual mode available.";
     latestRates.source = "manual";
     console.log(latestRates.status);
+    upstoxWsConnecting = false;
     return;
   }
 
@@ -878,6 +945,8 @@ async function connectUpstox() {
     }
     console.error(latestRates.status);
     broadcast();
+    upstoxWsConnecting = false;
+    liveFeedStatus = "Reconnect scheduled";
     setTimeout(connectUpstox, 30000);
     return;
   }
@@ -886,6 +955,7 @@ async function connectUpstox() {
     try { currentUpstoxWs.close(); } catch {}
   }
 
+  upstoxWsConnecting = false;
   const ws = new WebSocket(authorizedUrl, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -894,6 +964,9 @@ async function connectUpstox() {
   currentUpstoxWs = ws;
 
   ws.on("open", () => {
+    upstoxWsAlive = true;
+    lastWebSocketPongAt = new Date().toISOString();
+    liveFeedStatus = "Connected";
     latestRates.status = "Connected to Upstox WebSocket.";
     latestRates.source = "upstox";
     console.log(latestRates.status);
@@ -912,6 +985,9 @@ async function connectUpstox() {
   });
 
   ws.on("message", (buffer) => {
+    lastWebSocketMessageAt = new Date().toISOString();
+    upstoxWsAlive = true;
+    liveFeedStatus = "Receiving data";
     try {
       let data;
 
@@ -964,13 +1040,24 @@ async function connectUpstox() {
   });
 
   ws.on("error", (error) => {
+    liveFeedStatus = "Error";
     latestRates.status = `Upstox WebSocket error: ${error.message}`;
     latestRates.source = "error";
     console.error(latestRates.status);
     broadcast();
   });
 
+  ws.on("pong", () => {
+    upstoxWsAlive = true;
+    lastWebSocketPongAt = new Date().toISOString();
+    liveFeedStatus = "Connected";
+  });
+
   ws.on("close", () => {
+    upstoxWsAlive = false;
+    upstoxWsConnecting = false;
+    liveFeedStatus = "Reconnecting";
+    websocketReconnectCount += 1;
     latestRates.status = "Upstox WebSocket closed. Reconnecting...";
     latestRates.source = "reconnecting";
     console.log(latestRates.status);
@@ -979,6 +1066,45 @@ async function connectUpstox() {
   });
 }
 
+
+
+function monitorUpstoxHeartbeat() {
+  lastHeartbeatCheckAt = new Date().toISOString();
+  if (!currentUpstoxWs) {
+    liveFeedStatus = "Not connected";
+    setTimeout(connectUpstox, 1000);
+    return;
+  }
+
+  if (currentUpstoxWs.readyState === WebSocket.OPEN) {
+    const lastPongMs = lastWebSocketPongAt ? new Date(lastWebSocketPongAt).getTime() : 0;
+    const pongAge = lastPongMs ? Date.now() - lastPongMs : Infinity;
+    if (!upstoxWsAlive || pongAge > 45000) {
+      liveFeedStatus = "Frozen - reconnecting";
+      latestRates.status = "Upstox WebSocket heartbeat failed. Reconnecting live feed...";
+      try { currentUpstoxWs.terminate(); } catch {}
+      currentUpstoxWs = null;
+      websocketReconnectCount += 1;
+      broadcast();
+      setTimeout(connectUpstox, 1000);
+      return;
+    }
+    upstoxWsAlive = false;
+    try { currentUpstoxWs.ping(); } catch (error) {
+      liveFeedStatus = "Ping failed - reconnecting";
+      try { currentUpstoxWs.terminate(); } catch {}
+      currentUpstoxWs = null;
+      websocketReconnectCount += 1;
+      setTimeout(connectUpstox, 1000);
+    }
+  } else if (currentUpstoxWs.readyState === WebSocket.CLOSED || currentUpstoxWs.readyState === WebSocket.CLOSING) {
+    liveFeedStatus = "Closed - reconnecting";
+    websocketReconnectCount += 1;
+    setTimeout(connectUpstox, 1000);
+  } else {
+    liveFeedStatus = "Connecting";
+  }
+}
 
 app.get("/upstox", (req, res) => {
   const ready = Boolean(UPSTOX_API_KEY && UPSTOX_API_SECRET);
@@ -1066,13 +1192,41 @@ async function updateRenderAccessTokenEnv(newToken) {
 }
 
 
-app.post("/api/upstox/manual-token", async (req, res) => {
+
+app.post("/api/admin/login", (req, res) => {
+  const password = String(req.body?.password || "");
+  const purpose = String(req.body?.purpose || "admin");
+  const isAccessPassword = password === ADMIN_ACCESS_PASSWORD;
+  const isUpdatePassword = password === ADMIN_UPDATE_PASSWORD;
+  if (!isAccessPassword && !isUpdatePassword) {
+    return res.status(401).json({ ok: false, message: "Wrong Password" });
+  }
+  const permissions = isUpdatePassword
+    ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
+    : ["atu:access"];
+  const token = signAdminJwt({ role: "admin", purpose, permissions });
+  res.json({ ok: true, token, expiresInSeconds: JWT_EXPIRY_SECONDS, permissions });
+});
+
+app.post("/api/admin/upstox-login-url", requireAdminJwt, (req, res) => {
+  const permissions = req.admin?.permissions || [];
+  if (!permissions.includes("upstox:reconnect")) {
+    return res.status(403).json({ ok: false, message: "Reconnect permission denied." });
+  }
+  if (!UPSTOX_API_KEY) return res.status(500).json({ ok: false, message: "Missing UPSTOX_API_KEY in Render Environment." });
+  res.json({ ok: true, loginUrl: getUpstoxLoginUrl(req) });
+});
+
+app.post("/api/upstox/manual-token", requireAdminJwt, async (req, res) => {
   const token = String(req.body?.accessToken || "").trim();
   if (!token) return res.status(400).json({ ok: false, message: "Access token is blank." });
   await saveAccessToken({ access_token: token, source: "ATU_MANUAL_UPDATE" });
   latestRates.status = "Access token manually updated from ATU page.";
   latestRates.source = "atu-token-update";
   const renderUpdate = await updateRenderAccessTokenEnv(token);
+  markRenderTokenActiveIfPossible(renderUpdate);
+  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
+  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
   try { await fetchLastAvailableQuotes(); } catch {}
   try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
   setTimeout(connectUpstox, 1000);
@@ -1081,7 +1235,7 @@ app.post("/api/upstox/manual-token", async (req, res) => {
 });
 
 
-app.get("/api/upstox/current-token", (req, res) => {
+app.get("/api/upstox/current-token", requireAdminJwt, (req, res) => {
   res.json({
     ok: Boolean(accessToken),
     accessToken: accessToken || "",
@@ -1112,6 +1266,11 @@ app.get("/api/upstox/status", (req, res) => {
     tokenAutoRefreshEnabled,
     accessTokenExpiresAt,
     lastAutoRefreshAt,
+    liveFeedStatus,
+    lastWebSocketMessageAt,
+    lastWebSocketPongAt,
+    websocketReconnectCount,
+    lastHeartbeatCheckAt,
     status: latestRates.status,
   });
 });
@@ -1146,7 +1305,10 @@ app.get("/api/upstox/callback", async (req, res) => {
     await saveAccessToken(response.data);
     const newTokenFromReconnect = response.data?.access_token || response.data?.accessToken;
     if (newTokenFromReconnect) {
-      await updateRenderAccessTokenEnv(newTokenFromReconnect);
+      const renderUpdate = await updateRenderAccessTokenEnv(newTokenFromReconnect);
+      markRenderTokenActiveIfPossible(renderUpdate);
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
     }
     latestRates.status = "Upstox reconnected successfully. Fetching latest rates.";
     latestRates.source = "upstox-reconnected";
@@ -1240,6 +1402,7 @@ async function startServer() {
   await prepareInstrumentKeys();
   fetchLastAvailableQuotes();
   setInterval(fetchLastAvailableQuotes, 1000);
+  setInterval(monitorUpstoxHeartbeat, 20000);
   setInterval(async () => {
     await prepareInstrumentKeys();
     await fetchLastAvailableQuotes();
