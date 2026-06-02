@@ -82,6 +82,11 @@ let latestRates = {
   silverOpen: null,
   goldPrevClose: null,
   silverPrevClose: null,
+  goldThirdLastClose: Number(process.env.GOLD_THIRD_LAST_CLOSE || 0) || null,
+  silverThirdLastClose: Number(process.env.SILVER_THIRD_LAST_CLOSE || 0) || null,
+  marketClosed: false,
+  marketClosedMessage: null,
+  marketClosedReferenceMode: "previous-close",
   goldHigh: null,
   silverHigh: null,
   goldLow: null,
@@ -127,6 +132,11 @@ function normalizeRecordedRates(data) {
     silverOpen: Number(data.silverOpen),
     goldPrevClose: Number(data.goldPrevClose),
     silverPrevClose: Number(data.silverPrevClose),
+    goldThirdLastClose: Number(data.goldThirdLastClose),
+    silverThirdLastClose: Number(data.silverThirdLastClose),
+    marketClosed: Boolean(data.marketClosed),
+    marketClosedMessage: data.marketClosedMessage || null,
+    marketClosedReferenceMode: data.marketClosedReferenceMode || null,
     goldHigh: Number(data.goldHigh),
     silverHigh: Number(data.silverHigh),
     goldLow: Number(data.goldLow),
@@ -149,6 +159,71 @@ async function recordLastGoodRatesToRender(reason = "live-rate") {
   process.env.LAST_RECORDED_RATES_UPDATED_AT = lastRecordedRatesUpdatedAt;
   try { await updateRenderEnvironmentVariable("LAST_RECORDED_RATES_JSON", JSON.stringify(lastRecordedRates)); } catch (e) { console.log("Could not sync last recorded rates JSON to Render:", e.message); }
   try { await updateRenderEnvironmentVariable("LAST_RECORDED_RATES_UPDATED_AT", lastRecordedRatesUpdatedAt); } catch (e) { console.log("Could not sync last recorded rates time to Render:", e.message); }
+}
+
+
+function getIstClockParts() {
+  const parts = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(new Date());
+  const hour = Number(parts.find((p) => p.type === "hour")?.value || 0);
+  const minute = Number(parts.find((p) => p.type === "minute")?.value || 0);
+  return { hour, minute };
+}
+
+let marketClosedAfter1159 = false;
+let marketClosedBaselineGold = null;
+let marketClosedBaselineSilver = null;
+
+function isAfter1159PmOrOvernightIst() {
+  const { hour, minute } = getIstClockParts();
+  // Start showing the closed state after 11:59 PM and keep it during the overnight period
+  // until a fresh gold/silver tick changes the MCX rate.
+  return (hour === 23 && minute >= 59) || hour < 9;
+}
+
+function refreshMarketClosedState() {
+  if (isAfter1159PmOrOvernightIst() && !marketClosedAfter1159) {
+    marketClosedAfter1159 = true;
+    marketClosedBaselineGold = Number.isFinite(Number(latestRates.goldMcx)) ? Number(latestRates.goldMcx) : null;
+    marketClosedBaselineSilver = Number.isFinite(Number(latestRates.silverMcx)) ? Number(latestRates.silverMcx) : null;
+  }
+  latestRates.marketClosed = Boolean(marketClosedAfter1159);
+  latestRates.marketClosedMessage = marketClosedAfter1159 ? "MARKET CLOSED" : null;
+  latestRates.marketClosedReferenceMode = marketClosedAfter1159 ? "third-last-trading-close" : "previous-trading-close";
+  return latestRates.marketClosed;
+}
+
+function clearMarketClosedIfRateChanged(nextGold, nextSilver) {
+  if (!marketClosedAfter1159) return;
+  const g = Number(nextGold);
+  const s = Number(nextSilver);
+  const goldChanged = Number.isFinite(g) && marketClosedBaselineGold != null && g !== marketClosedBaselineGold;
+  const silverChanged = Number.isFinite(s) && marketClosedBaselineSilver != null && s !== marketClosedBaselineSilver;
+  if (goldChanged || silverChanged) {
+    marketClosedAfter1159 = false;
+    marketClosedBaselineGold = null;
+    marketClosedBaselineSilver = null;
+    latestRates.marketClosed = false;
+    latestRates.marketClosedMessage = null;
+    latestRates.marketClosedReferenceMode = "previous-trading-close";
+  }
+}
+
+function setPreviousCloseWithHistory(metal, close) {
+  const c = Number(close);
+  if (!Number.isFinite(c) || c <= 0) return false;
+  const prevKey = `${metal}PrevClose`;
+  const thirdKey = `${metal}ThirdLastClose`;
+  const oldPrev = Number(latestRates[prevKey]);
+  if (Number.isFinite(oldPrev) && oldPrev > 0 && oldPrev !== c) {
+    latestRates[thirdKey] = oldPrev;
+  }
+  latestRates[prevKey] = c;
+  return true;
 }
 
 function shouldShowLastRecordedRates() {
@@ -827,6 +902,7 @@ async function prepareInstrumentKeys() {
 
 function calculateRates(goldMcx, silverMcx, req = null) {
   const tokenState = tokenExpiryState();
+  const marketClosed = refreshMarketClosedState();
   const useRecorded = shouldShowLastRecordedRates();
   const sourceRates = useRecorded ? lastRecordedRates : latestRates;
   const gold = Number(useRecorded ? sourceRates.goldMcx : goldMcx);
@@ -846,6 +922,13 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     silverOpen: sourceRates.silverOpen,
     goldPrevClose: sourceRates.goldPrevClose,
     silverPrevClose: sourceRates.silverPrevClose,
+    goldThirdLastClose: sourceRates.goldThirdLastClose || latestRates.goldThirdLastClose || null,
+    silverThirdLastClose: sourceRates.silverThirdLastClose || latestRates.silverThirdLastClose || null,
+    goldComparisonClose: marketClosed ? (sourceRates.goldThirdLastClose || latestRates.goldThirdLastClose || sourceRates.goldPrevClose) : sourceRates.goldPrevClose,
+    silverComparisonClose: marketClosed ? (sourceRates.silverThirdLastClose || latestRates.silverThirdLastClose || sourceRates.silverPrevClose) : sourceRates.silverPrevClose,
+    marketClosed,
+    marketClosedMessage: marketClosed ? "MARKET CLOSED" : null,
+    marketClosedReferenceMode: marketClosed ? "third-last-trading-close" : "previous-trading-close",
     goldHigh: sourceRates.goldHigh,
     silverHigh: sourceRates.silverHigh,
     goldLow: sourceRates.goldLow,
@@ -982,7 +1065,7 @@ function applyQuoteFallback(quote, metal) {
   let updated = false;
   if (Number.isFinite(ltp)) { latestRates[`${metal}Mcx`] = ltp; updated = true; }
   if (Number.isFinite(open)) { latestRates[`${metal}Open`] = open; updated = true; }
-  if (Number.isFinite(close)) { latestRates[`${metal}PrevClose`] = close; updated = true; }
+  if (Number.isFinite(close)) { setPreviousCloseWithHistory(metal, close); updated = true; }
   if (Number.isFinite(high)) { latestRates[`${metal}High`] = high; updated = true; }
   if (Number.isFinite(low)) { latestRates[`${metal}Low`] = low; updated = true; }
   return updated;
@@ -1006,6 +1089,7 @@ async function fetchLastAvailableQuotes() {
     const updatedSilver = applyQuoteFallback(silverQuote, "silver");
 
     if (updatedGold || updatedSilver) {
+      refreshMarketClosedState();
       latestRates.lastUpdated = new Date().toISOString();
       latestRates.source = "upstox-last-quote";
       latestRates.status = "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
@@ -1147,22 +1231,24 @@ async function connectUpstox() {
       const goldOhlc = extractDayOhlcFromFeed(data, GOLD_KEY);
       const silverOhlc = extractDayOhlcFromFeed(data, SILVER_KEY);
 
+      clearMarketClosedIfRateChanged(gold ?? latestRates.goldMcx, silver ?? latestRates.silverMcx);
       if (gold != null) latestRates.goldMcx = gold;
       if (silver != null) latestRates.silverMcx = silver;
       if (goldOhlc) {
         if (goldOhlc.open != null) latestRates.goldOpen = goldOhlc.open;
-        if (goldOhlc.close != null) latestRates.goldPrevClose = goldOhlc.close;
+        if (goldOhlc.close != null) setPreviousCloseWithHistory("gold", goldOhlc.close);
         if (goldOhlc.high != null) latestRates.goldHigh = goldOhlc.high;
         if (goldOhlc.low != null) latestRates.goldLow = goldOhlc.low;
       }
       if (silverOhlc) {
         if (silverOhlc.open != null) latestRates.silverOpen = silverOhlc.open;
-        if (silverOhlc.close != null) latestRates.silverPrevClose = silverOhlc.close;
+        if (silverOhlc.close != null) setPreviousCloseWithHistory("silver", silverOhlc.close);
         if (silverOhlc.high != null) latestRates.silverHigh = silverOhlc.high;
         if (silverOhlc.low != null) latestRates.silverLow = silverOhlc.low;
       }
 
       if (gold != null || silver != null || goldOhlc || silverOhlc) {
+        refreshMarketClosedState();
         latestRates.lastUpdated = new Date().toISOString();
         latestRates.source = "upstox";
         latestRates.status = "Live rates updated.";
@@ -1216,6 +1302,7 @@ async function connectUpstox() {
 
 function monitorUpstoxHeartbeat() {
   lastHeartbeatCheckAt = new Date().toISOString();
+  refreshMarketClosedState();
   if (!currentUpstoxWs) {
     liveFeedStatus = "Not connected";
     setTimeout(connectUpstox, 1000);
