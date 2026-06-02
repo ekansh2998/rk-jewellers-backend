@@ -19,8 +19,8 @@ const PORT = process.env.PORT || 4000;
 const UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize";
 const UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token";
 const renderEnvAccessToken = process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_accessToken || null;
-let accessToken = renderEnvAccessToken || null;
-let activeTokenSource = renderEnvAccessToken ? "render-env-backup" : "none";
+let accessToken = null;
+let activeTokenSource = "none";
 let memoryBackupAccessToken = renderEnvAccessToken || null;
 let refreshToken = null; // Upstox does not provide refresh-token auto renewal in this setup.
 let accessTokenExpiresAt = process.env.UPSTOX_TOKEN_EXPIRES_AT || null;
@@ -79,6 +79,8 @@ let latestRates = {
   silverMcx: null,
   goldOpen: null,
   silverOpen: null,
+  goldPrevClose: null,
+  silverPrevClose: null,
   goldHigh: null,
   silverHigh: null,
   goldLow: null,
@@ -122,6 +124,8 @@ function normalizeRecordedRates(data) {
     silverMcx: Number(data.silverMcx),
     goldOpen: Number(data.goldOpen),
     silverOpen: Number(data.silverOpen),
+    goldPrevClose: Number(data.goldPrevClose),
+    silverPrevClose: Number(data.silverPrevClose),
     goldHigh: Number(data.goldHigh),
     silverHigh: Number(data.silverHigh),
     goldLow: Number(data.goldLow),
@@ -179,7 +183,7 @@ async function initMongoTokenStore() {
   }
 
   try {
-    mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
+    mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 4000, connectTimeoutMS: 4000 });
     await mongoClient.connect();
     tokenCollection = mongoClient.db(MONGODB_DB_NAME).collection(TOKEN_COLLECTION);
     mongoLastError = null;
@@ -865,6 +869,7 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     reconnectPath: (tokenNeedsReconnect || tokenState.expired) ? "/upstox" : null,
     mongoConnected: Boolean(tokenCollection),
     tokenStorage: activeTokenSource,
+    tokenPriority: "mongodb -> render-env-backup -> server-memory-backup",
     usingRenderBackupToken: activeTokenSource === "render-env-backup" && tokensWorking(),
     usingMemoryBackupToken: activeTokenSource === "server-memory-backup" && tokensWorking(),
     renderTokenAccess: activeTokenSource === "render-env-backup" && tokensWorking(),
@@ -924,8 +929,10 @@ function extractDayOhlcFromFeed(raw, instrumentKey) {
   const day = ohlcList.find((x) => String(x.interval || "").toLowerCase() === "1d") || ohlcList[0];
   if (!day) return null;
   const open = Number(day.open), high = Number(day.high), low = Number(day.low);
+  const close = Number(day.close ?? day.cp ?? day.previousClose ?? day.prev_close);
   return {
     open: Number.isFinite(open) ? open : null,
+    close: Number.isFinite(close) ? close : null,
     high: Number.isFinite(high) ? high : null,
     low: Number.isFinite(low) ? low : null,
   };
@@ -948,12 +955,14 @@ function applyQuoteFallback(quote, metal) {
   const ltp = Number(quote.last_price ?? quote.ltp ?? quote.lastPrice ?? quote.close ?? quote.cp);
   const ohlc = quote.ohlc || quote.OHLC || quote.day_ohlc || {};
   const open = Number(ohlc.open ?? quote.open);
+  const close = Number(ohlc.close ?? quote.close ?? quote.cp ?? quote.previousClose ?? quote.prev_close);
   const high = Number(ohlc.high ?? quote.high);
   const low = Number(ohlc.low ?? quote.low);
 
   let updated = false;
   if (Number.isFinite(ltp)) { latestRates[`${metal}Mcx`] = ltp; updated = true; }
   if (Number.isFinite(open)) { latestRates[`${metal}Open`] = open; updated = true; }
+  if (Number.isFinite(close)) { latestRates[`${metal}PrevClose`] = close; updated = true; }
   if (Number.isFinite(high)) { latestRates[`${metal}High`] = high; updated = true; }
   if (Number.isFinite(low)) { latestRates[`${metal}Low`] = low; updated = true; }
   return updated;
@@ -968,7 +977,7 @@ async function fetchLastAvailableQuotes() {
     const url = `https://api.upstox.com/v2/market-quote/quotes?instrument_key=${instrumentKeys}`;
     const response = await axios.get(url, {
       headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
-      timeout: 10000,
+      timeout: 5000,
     });
 
     const goldQuote = pickQuoteObject(response.data, GOLD_KEY);
@@ -1122,11 +1131,13 @@ async function connectUpstox() {
       if (silver != null) latestRates.silverMcx = silver;
       if (goldOhlc) {
         if (goldOhlc.open != null) latestRates.goldOpen = goldOhlc.open;
+        if (goldOhlc.close != null) latestRates.goldPrevClose = goldOhlc.close;
         if (goldOhlc.high != null) latestRates.goldHigh = goldOhlc.high;
         if (goldOhlc.low != null) latestRates.goldLow = goldOhlc.low;
       }
       if (silverOhlc) {
         if (silverOhlc.open != null) latestRates.silverOpen = silverOhlc.open;
+        if (silverOhlc.close != null) latestRates.silverPrevClose = silverOhlc.close;
         if (silverOhlc.high != null) latestRates.silverHigh = silverOhlc.high;
         if (silverOhlc.low != null) latestRates.silverLow = silverOhlc.low;
       }
