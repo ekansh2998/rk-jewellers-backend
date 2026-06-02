@@ -25,6 +25,7 @@ let memoryBackupAccessToken = renderEnvAccessToken || null;
 let refreshToken = null; // Upstox does not provide refresh-token auto renewal in this setup.
 let accessTokenExpiresAt = process.env.UPSTOX_TOKEN_EXPIRES_AT || null;
 let accessTokenUpdatedAt = process.env.UPSTOX_TOKEN_UPDATED_AT || null;
+let accessTokenGeneratedBy = process.env.UPSTOX_TOKEN_GENERATED_BY || process.env.TOKEN_GENERATED_BY || null;
 let lastAutoRefreshAt = null;
 const CACHE_FILE = path.join(__dirname, "rates-cache.json");
 const TOKEN_FILE = path.join(__dirname, "upstox-token.json");
@@ -201,6 +202,7 @@ function applySavedTokenData(saved, sourceLabel) {
   const savedRefresh = saved.refresh_token || saved.refreshToken;
   const savedExpiresAt = saved.expires_at || saved.expiresAt || saved.accessTokenExpiresAt;
   const savedUpdatedAt = saved.updatedAt || saved.savedAt || saved.accessTokenUpdatedAt;
+  const savedGeneratedBy = saved.generatedBy || saved.tokenGeneratedBy || saved.source || saved.method || null;
 
   if (savedAccess) {
     accessToken = savedAccess;
@@ -212,6 +214,7 @@ function applySavedTokenData(saved, sourceLabel) {
   if (decodedSavedExpiry) accessTokenExpiresAt = decodedSavedExpiry;
   else if (savedExpiresAt) accessTokenExpiresAt = savedExpiresAt;
   if (savedUpdatedAt) accessTokenUpdatedAt = savedUpdatedAt;
+  if (savedGeneratedBy) accessTokenGeneratedBy = savedGeneratedBy;
 
   if (accessToken) {
     tokenNeedsReconnect = false;
@@ -431,6 +434,7 @@ async function saveAccessToken(tokenData) {
   tokenLastError = null;
   tokenAutoRefreshEnabled = Boolean(refreshToken);
   accessTokenUpdatedAt = new Date().toISOString();
+  accessTokenGeneratedBy = tokenData.generatedBy || tokenData.tokenGeneratedBy || tokenData.source || accessTokenGeneratedBy || "unknown";
 
   const dataToSave = {
     ...tokenData,
@@ -440,6 +444,8 @@ async function saveAccessToken(tokenData) {
     autoRefreshEnabled: tokenAutoRefreshEnabled,
     savedAt: accessTokenUpdatedAt,
     updatedAt: accessTokenUpdatedAt,
+    generatedBy: accessTokenGeneratedBy,
+    tokenGeneratedBy: accessTokenGeneratedBy,
   };
 
   try {
@@ -875,6 +881,7 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     tokenAutoRefreshEnabled,
     refreshTokenPresent: Boolean(refreshToken),
     accessTokenExpiresAt,
+    tokenGeneratedBy: accessTokenGeneratedBy || null,
     tokenExpiryDisplay: tokenState.label,
     tokenExpired: tokenState.expired,
     tokenWorking: tokensWorking(),
@@ -1366,13 +1373,14 @@ app.post("/api/admin/upstox-login-url", requireAdminJwt, (req, res) => {
 app.post("/api/upstox/manual-token", requireAdminJwt, async (req, res) => {
   const token = String(req.body?.accessToken || "").trim();
   if (!token) return res.status(400).json({ ok: false, message: "Access token is blank." });
-  await saveAccessToken({ access_token: token, source: "ATU_MANUAL_UPDATE" });
+  await saveAccessToken({ access_token: token, source: "manual", generatedBy: "manual" });
   latestRates.status = "Access token manually updated from ATU page.";
   latestRates.source = "atu-token-update";
   const renderUpdate = await updateRenderAccessTokenEnv(token);
   markRenderTokenActiveIfPossible(renderUpdate);
   try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
   try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
+  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
   try { await fetchLastAvailableQuotes(); } catch {}
   try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
   setTimeout(connectUpstox, 1000);
@@ -1386,6 +1394,8 @@ app.get("/api/upstox/current-token", requireAdminJwt, (req, res) => {
     ok: Boolean(accessToken),
     accessToken: accessToken || "",
     updatedAt: accessTokenUpdatedAt || accessTokenExpiresAt || null,
+    generatedBy: accessTokenGeneratedBy || null,
+    tokenGeneratedBy: accessTokenGeneratedBy || null,
     accessTokenExpiresAt,
     tokenStorage: activeTokenSource,
     mongoConnected: Boolean(tokenCollection),
@@ -1412,6 +1422,7 @@ app.get("/api/upstox/status", (req, res) => {
     refreshTokenPresent: Boolean(refreshToken),
     tokenAutoRefreshEnabled,
     accessTokenExpiresAt,
+    tokenGeneratedBy: accessTokenGeneratedBy || null,
     tokenExpiryDisplay: tokenExpiryState().label,
     tokenExpired: tokenExpiryState().expired,
     tokenWorking: tokensWorking(),
@@ -1458,13 +1469,14 @@ app.get("/api/upstox/callback", async (req, res) => {
       timeout: 15000,
     });
 
-    await saveAccessToken(response.data);
+    await saveAccessToken({ ...response.data, source: "reconnect-to-upstox", generatedBy: "reconnect-to-upstox" });
     const newTokenFromReconnect = response.data?.access_token || response.data?.accessToken;
     if (newTokenFromReconnect) {
       const renderUpdate = await updateRenderAccessTokenEnv(newTokenFromReconnect);
       markRenderTokenActiveIfPossible(renderUpdate);
       try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
       try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
     }
     latestRates.status = "Upstox reconnected successfully. Fetching latest rates.";
     latestRates.source = "upstox-reconnected";
