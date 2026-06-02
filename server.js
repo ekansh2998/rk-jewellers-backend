@@ -46,6 +46,13 @@ const ADMIN_UPDATE_PASSWORD = process.env.ADMIN_UPDATE_PASSWORD || "Widber";
 const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_JWT_SECRET || crypto.createHash("sha256").update(String(UPSTOX_API_SECRET || UPSTOX_API_KEY || "rk-jewellers-local-secret")).digest("hex");
 const JWT_EXPIRY_SECONDS = Number(process.env.JWT_EXPIRY_SECONDS || 60 * 60);
 
+// Real admin JWT session state for status visibility.
+// Protected admin routes still require a valid Bearer JWT, but these values
+// let /api/rates and /api/upstox/status show whether an admin session is active.
+let lastAdminSessionToken = null;
+let lastAdminSessionPayload = null;
+let lastAdminSessionExpiresAt = null;
+
 let tokenNeedsReconnect = false;
 let tokenLastError = null;
 let currentUpstoxWs = null;
@@ -316,6 +323,36 @@ function requireAdminJwt(req, res, next) {
   if (!payload) return res.status(401).json({ ok: false, message: "Admin session expired or invalid. Enter password again." });
   req.admin = payload;
   next();
+}
+
+function getAdminSessionState(req = null) {
+  let payload = null;
+  if (req) {
+    const auth = req.headers.authorization || "";
+    const headerToken = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (headerToken) payload = verifyAdminJwt(headerToken);
+  }
+
+  const memorySessionValid = Boolean(
+    lastAdminSessionToken &&
+    lastAdminSessionExpiresAt &&
+    Date.now() < Number(lastAdminSessionExpiresAt)
+  );
+
+  if (!payload && memorySessionValid) payload = lastAdminSessionPayload;
+
+  return {
+    jwtEnabled: true,
+    adminSession: Boolean(payload || memorySessionValid),
+    authVerified: Boolean(payload || memorySessionValid),
+    adminSessionExpiresAt: payload?.exp ? new Date(Number(payload.exp) * 1000).toISOString() : (memorySessionValid ? new Date(Number(lastAdminSessionExpiresAt)).toISOString() : null),
+  };
+}
+
+function rememberAdminSession(token, payload) {
+  lastAdminSessionToken = token;
+  lastAdminSessionPayload = payload;
+  lastAdminSessionExpiresAt = payload?.exp ? Number(payload.exp) * 1000 : Date.now() + JWT_EXPIRY_SECONDS * 1000;
 }
 
 function markRenderTokenActiveIfPossible(renderUpdate) {
@@ -767,7 +804,7 @@ async function prepareInstrumentKeys() {
   }
 }
 
-function calculateRates(goldMcx, silverMcx) {
+function calculateRates(goldMcx, silverMcx, req = null) {
   const tokenState = tokenExpiryState();
   const useRecorded = shouldShowLastRecordedRates();
   const sourceRates = useRecorded ? lastRecordedRates : latestRates;
@@ -778,7 +815,8 @@ function calculateRates(goldMcx, silverMcx) {
 
   const gold24k = Number.isFinite(gold) ? (gold + gDiff) / 0.995 : null;
   const silver1kg = Number.isFinite(silver) ? silver + sDiff : null;
-  const adminSession = false;
+  const adminState = getAdminSessionState(req);
+  const adminSession = adminState.adminSession;
 
   return {
     goldMcx: Number.isFinite(gold) ? gold : null,
@@ -833,9 +871,10 @@ function calculateRates(goldMcx, silverMcx) {
     backendMemoryTokenAccess: activeTokenSource === "server-memory-backup" && tokensWorking(),
     mongoWarning: getMongoFallbackMessage(),
     mongoLastError,
-    jwtEnabled: true,
+    jwtEnabled: adminState.jwtEnabled,
     adminSession,
-    authVerified: adminSession,
+    authVerified: adminState.authVerified,
+    adminSessionExpiresAt: adminState.adminSessionExpiresAt,
     goldInstrumentKey: GOLD_KEY,
     silverInstrumentKey: SILVER_KEY,
     goldContract: latestRates.goldContract || null,
@@ -1281,12 +1320,14 @@ app.post("/api/admin/login", (req, res) => {
     ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
     : ["atu:access"];
   const token = signAdminJwt({ role: "admin", purpose, permissions });
-  res.json({ ok: true, token, expiresInSeconds: JWT_EXPIRY_SECONDS, permissions, jwtEnabled:true, adminSession:true, authVerified:true });
+  const payload = verifyAdminJwt(token);
+  rememberAdminSession(token, payload);
+  res.json({ ok: true, token, expiresInSeconds: JWT_EXPIRY_SECONDS, permissions, jwtEnabled:true, adminSession:true, authVerified:true, adminSessionExpiresAt: getAdminSessionState(req).adminSessionExpiresAt });
 });
 
 
 app.get("/api/admin/session", requireAdminJwt, (req, res) => {
-  res.json({ ok: true, jwtEnabled: true, adminSession: true, authVerified: true, admin: req.admin });
+  res.json({ ok: true, ...getAdminSessionState(req), admin: req.admin });
 });
 
 app.post("/api/admin/upstox-login-url", requireAdminJwt, (req, res) => {
@@ -1329,6 +1370,7 @@ app.get("/api/upstox/current-token", requireAdminJwt, (req, res) => {
 });
 
 app.get("/api/upstox/status", (req, res) => {
+  const adminState = getAdminSessionState(req);
   res.json({
     hasApiKey: Boolean(UPSTOX_API_KEY),
     hasApiSecret: Boolean(UPSTOX_API_SECRET),
@@ -1351,9 +1393,10 @@ app.get("/api/upstox/status", (req, res) => {
     tokenWorking: tokensWorking(),
     renderTokenAccess: activeTokenSource === "render-env-backup" && tokensWorking(),
     backendMemoryTokenAccess: activeTokenSource === "server-memory-backup" && tokensWorking(),
-    jwtEnabled: true,
-    adminSession: false,
-    authVerified: false,
+    jwtEnabled: adminState.jwtEnabled,
+    adminSession: adminState.adminSession,
+    authVerified: adminState.authVerified,
+    adminSessionExpiresAt: adminState.adminSessionExpiresAt,
     lastAutoRefreshAt,
     liveFeedStatus,
     lastWebSocketMessageAt,
@@ -1424,7 +1467,7 @@ app.get("/api/rates", async (req, res) => {
   if (!GOLD_KEY || !SILVER_KEY) {
     await prepareInstrumentKeys();
   }
-  res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
+  res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx, req));
 });
 
 app.post("/api/manual-rates", requireAdminJwt, (req, res) => {
