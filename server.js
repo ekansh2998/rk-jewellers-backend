@@ -290,6 +290,10 @@ function applySavedTokenData(saved, sourceLabel) {
   else if (savedExpiresAt) accessTokenExpiresAt = savedExpiresAt;
   if (savedUpdatedAt) accessTokenUpdatedAt = savedUpdatedAt;
   if (savedGeneratedBy) accessTokenGeneratedBy = savedGeneratedBy;
+  if (Number.isFinite(Number(saved.goldPrevClose))) latestRates.goldPrevClose = Number(saved.goldPrevClose);
+  if (Number.isFinite(Number(saved.silverPrevClose))) latestRates.silverPrevClose = Number(saved.silverPrevClose);
+  if (Number.isFinite(Number(saved.goldThirdLastClose))) latestRates.goldThirdLastClose = Number(saved.goldThirdLastClose);
+  if (Number.isFinite(Number(saved.silverThirdLastClose))) latestRates.silverThirdLastClose = Number(saved.silverThirdLastClose);
 
   if (accessToken) {
     tokenNeedsReconnect = false;
@@ -1071,6 +1075,135 @@ function applyQuoteFallback(quote, metal) {
   return updated;
 }
 
+let historicalCloseLastFetchAt = 0;
+
+function formatDateYYYYMMDD(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function getIstDateOnlyString(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+
+function normalizeCandleList(raw) {
+  const candles = raw?.data?.candles || raw?.candles || raw?.data || [];
+  if (!Array.isArray(candles)) return [];
+  return candles.map((c) => {
+    if (Array.isArray(c)) {
+      return { ts: c[0], open: Number(c[1]), high: Number(c[2]), low: Number(c[3]), close: Number(c[4]) };
+    }
+    return {
+      ts: c.ts || c.timestamp || c.time || c.date,
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close ?? c.cp),
+    };
+  }).filter((c) => Number.isFinite(c.close) && c.close > 0 && c.ts);
+}
+
+async function fetchDailyCandlesForInstrument(instrumentKey) {
+  if (!instrumentKey || !accessToken) return [];
+  const to = new Date();
+  const from = new Date(Date.now() - 18 * 24 * 60 * 60 * 1000);
+  const toDate = formatDateYYYYMMDD(to);
+  const fromDate = formatDateYYYYMMDD(from);
+  const encodedKey = encodeURIComponent(instrumentKey);
+  const urls = [
+    `https://api.upstox.com/v2/historical-candle/${encodedKey}/day/${toDate}/${fromDate}`,
+    `https://api.upstox.com/v2/historical-candle/${encodedKey}/1day/${toDate}/${fromDate}`,
+  ];
+
+  for (const url of urls) {
+    try {
+      const response = await axios.get(url, {
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+        timeout: 8000,
+      });
+      const list = normalizeCandleList(response.data);
+      if (list.length) return list;
+    } catch (error) {
+      const msg = error.response?.data?.errors?.[0]?.message || error.response?.data?.message || error.message;
+      console.log("Historical candle fetch failed:", msg);
+    }
+  }
+  return [];
+}
+
+function applyHistoricalCloses(metal, candles) {
+  const todayIst = getIstDateOnlyString();
+  const completed = candles
+    .map((c) => ({ ...c, dateOnly: String(c.ts).slice(0, 10) }))
+    .filter((c) => c.dateOnly && c.dateOnly < todayIst)
+    .sort((a, b) => String(b.dateOnly).localeCompare(String(a.dateOnly)));
+
+  // completed[0] = previous/last completed trading day close.
+  // completed[1] = third-last trading close as used in this app's market-closed logic.
+  const previousClose = completed[0]?.close;
+  const thirdLastClose = completed[1]?.close;
+  let changed = false;
+  if (Number.isFinite(previousClose) && previousClose > 0) {
+    latestRates[`${metal}PrevClose`] = previousClose;
+    changed = true;
+  }
+  if (Number.isFinite(thirdLastClose) && thirdLastClose > 0) {
+    latestRates[`${metal}ThirdLastClose`] = thirdLastClose;
+    changed = true;
+  }
+  return changed;
+}
+
+async function saveHistoricalClosesToMongo() {
+  if (!tokenCollection) return;
+  const payload = {
+    goldPrevClose: latestRates.goldPrevClose || null,
+    silverPrevClose: latestRates.silverPrevClose || null,
+    goldThirdLastClose: latestRates.goldThirdLastClose || null,
+    silverThirdLastClose: latestRates.silverThirdLastClose || null,
+    historicalCloseUpdatedAt: new Date().toISOString(),
+  };
+  try {
+    await tokenCollection.updateOne({ _id: TOKEN_DOC_ID }, { $set: payload }, { upsert: true });
+  } catch (error) {
+    console.log("Could not save historical closes to MongoDB:", error.message);
+  }
+}
+
+async function refreshHistoricalTradingCloses(force = false) {
+  if (!GOLD_KEY || !SILVER_KEY || !accessToken) return false;
+  const now = Date.now();
+  if (!force && now - historicalCloseLastFetchAt < 10 * 60 * 1000) return false;
+  historicalCloseLastFetchAt = now;
+
+  try {
+    const [goldCandles, silverCandles] = await Promise.all([
+      fetchDailyCandlesForInstrument(GOLD_KEY),
+      fetchDailyCandlesForInstrument(SILVER_KEY),
+    ]);
+    const goldChanged = applyHistoricalCloses("gold", goldCandles);
+    const silverChanged = applyHistoricalCloses("silver", silverCandles);
+    if (goldChanged || silverChanged) {
+      latestRates.historicalCloseUpdatedAt = new Date().toISOString();
+      await saveHistoricalClosesToMongo();
+      saveCachedRates();
+      broadcast();
+      console.log("Historical previous/third-last closes updated.", {
+        goldPrevClose: latestRates.goldPrevClose,
+        goldThirdLastClose: latestRates.goldThirdLastClose,
+        silverPrevClose: latestRates.silverPrevClose,
+        silverThirdLastClose: latestRates.silverThirdLastClose,
+      });
+      return true;
+    }
+  } catch (error) {
+    console.log("Historical close refresh failed:", error.message);
+  }
+  return false;
+}
+
 async function fetchLastAvailableQuotes() {
   await ensureValidAccessToken();
   if (!accessToken || !GOLD_KEY || !SILVER_KEY) return false;
@@ -1093,6 +1226,7 @@ async function fetchLastAvailableQuotes() {
       latestRates.lastUpdated = new Date().toISOString();
       latestRates.source = "upstox-last-quote";
       latestRates.status = "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
+      await refreshHistoricalTradingCloses(false);
       saveCachedRates();
       recordLastGoodRatesToRender("rest-last-quote");
       broadcast();
@@ -1256,6 +1390,7 @@ async function connectUpstox() {
           gold: latestRates.goldMcx,
           silver: latestRates.silverMcx,
         });
+        refreshHistoricalTradingCloses(false).catch(() => {});
         saveCachedRates();
         recordLastGoodRatesToRender("websocket-live");
         broadcast();
@@ -1658,8 +1793,10 @@ async function startServer() {
   await initMongoTokenStore();
   await loadSavedAccessToken();
   await prepareInstrumentKeys();
+  refreshHistoricalTradingCloses(true).catch(() => {});
   fetchLastAvailableQuotes();
   setInterval(fetchLastAvailableQuotes, 1000);
+  setInterval(() => refreshHistoricalTradingCloses(false).catch(() => {}), 10 * 60 * 1000);
   setInterval(monitorUpstoxHeartbeat, 20000);
   setInterval(async () => {
     await prepareInstrumentKeys();
