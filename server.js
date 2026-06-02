@@ -81,6 +81,68 @@ let latestRates = {
   status: "Server started. Waiting for Upstox feed.",
 };
 
+function parseJsonEnv(key, fallback = null) {
+  try {
+    const raw = process.env[key];
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+let lastRecordedRates = parseJsonEnv("LAST_RECORDED_RATES_JSON", null);
+let lastRecordedRatesUpdatedAt = process.env.LAST_RECORDED_RATES_UPDATED_AT || lastRecordedRates?.lastUpdated || null;
+let lastRecordedRenderSyncAt = 0;
+
+function tokenExpiryState() {
+  if (!accessTokenExpiresAt) return { expired: false, valid: Boolean(accessToken), label: "Not available" };
+  const t = new Date(accessTokenExpiresAt).getTime();
+  if (!Number.isFinite(t)) return { expired: false, valid: Boolean(accessToken), label: "Not available" };
+  const expired = Date.now() >= t;
+  return { expired, valid: Boolean(accessToken) && !expired && !tokenNeedsReconnect, label: expired ? "TOKEN EXPIRED OR NOT WORKING" : accessTokenExpiresAt };
+}
+
+function tokensWorking() {
+  const state = tokenExpiryState();
+  return Boolean(accessToken) && !tokenNeedsReconnect && !state.expired;
+}
+
+function normalizeRecordedRates(data) {
+  if (!data) return null;
+  return {
+    goldMcx: Number(data.goldMcx),
+    silverMcx: Number(data.silverMcx),
+    goldOpen: Number(data.goldOpen),
+    silverOpen: Number(data.silverOpen),
+    goldHigh: Number(data.goldHigh),
+    silverHigh: Number(data.silverHigh),
+    goldLow: Number(data.goldLow),
+    silverLow: Number(data.silverLow),
+    lastUpdated: data.lastUpdated || data.recordedAt || new Date().toISOString(),
+    recordedAt: data.recordedAt || data.lastUpdated || new Date().toISOString(),
+  };
+}
+
+async function recordLastGoodRatesToRender(reason = "live-rate") {
+  if (!tokensWorking()) return;
+  if (latestRates.goldMcx == null && latestRates.silverMcx == null) return;
+  const now = Date.now();
+  // Render Environment API is not designed for every-second writes. 60 sec throttling keeps it safe and reliable.
+  if (now - lastRecordedRenderSyncAt < 60000) return;
+  lastRecordedRenderSyncAt = now;
+  lastRecordedRates = normalizeRecordedRates({ ...latestRates, recordedAt: new Date().toISOString() });
+  lastRecordedRatesUpdatedAt = lastRecordedRates.recordedAt;
+  process.env.LAST_RECORDED_RATES_JSON = JSON.stringify(lastRecordedRates);
+  process.env.LAST_RECORDED_RATES_UPDATED_AT = lastRecordedRatesUpdatedAt;
+  try { await updateRenderEnvironmentVariable("LAST_RECORDED_RATES_JSON", JSON.stringify(lastRecordedRates)); } catch (e) { console.log("Could not sync last recorded rates JSON to Render:", e.message); }
+  try { await updateRenderEnvironmentVariable("LAST_RECORDED_RATES_UPDATED_AT", lastRecordedRatesUpdatedAt); } catch (e) { console.log("Could not sync last recorded rates time to Render:", e.message); }
+}
+
+function shouldShowLastRecordedRates() {
+  return !tokensWorking() && lastRecordedRates && (lastRecordedRates.goldMcx || lastRecordedRates.silverMcx);
+}
+
 function loadCachedRates() {
   try {
     if (!fs.existsSync(CACHE_FILE)) return;
@@ -395,9 +457,9 @@ function getUpstoxLoginUrl(req) {
 
 function markTokenReconnectNeeded(message) {
   tokenNeedsReconnect = true;
-  tokenLastError = message || "Upstox token expired or invalid. Reconnect Upstox once.";
+  tokenLastError = message || "TOKEN EXPIRED OR NOT WORKING";
   latestRates.source = latestRates.goldMcx || latestRates.silverMcx ? "upstox-last-quote" : "token-expired";
-  latestRates.status = tokenLastError;
+  latestRates.status = "TOKEN EXPIRED OR NOT WORKING";
 }
 
 const clients = new Set();
@@ -706,26 +768,27 @@ async function prepareInstrumentKeys() {
 }
 
 function calculateRates(goldMcx, silverMcx) {
-  const gold = Number(goldMcx);
-  const silver = Number(silverMcx);
+  const tokenState = tokenExpiryState();
+  const useRecorded = shouldShowLastRecordedRates();
+  const sourceRates = useRecorded ? lastRecordedRates : latestRates;
+  const gold = Number(useRecorded ? sourceRates.goldMcx : goldMcx);
+  const silver = Number(useRecorded ? sourceRates.silverMcx : silverMcx);
   const gDiff = Number(goldDifference || 0);
   const sDiff = Number(silverDifference || 0);
 
-  // Formula 1: 24K = (MCX Gold Rate + Gold Rate Difference) / 0.995
   const gold24k = Number.isFinite(gold) ? (gold + gDiff) / 0.995 : null;
-
-  // Formula 2: Silver 1KG = MCX Silver Rate + Silver Rate Difference
   const silver1kg = Number.isFinite(silver) ? silver + sDiff : null;
+  const adminSession = false;
 
   return {
     goldMcx: Number.isFinite(gold) ? gold : null,
     silverMcx: Number.isFinite(silver) ? silver : null,
-    goldOpen: latestRates.goldOpen,
-    silverOpen: latestRates.silverOpen,
-    goldHigh: latestRates.goldHigh,
-    silverHigh: latestRates.silverHigh,
-    goldLow: latestRates.goldLow,
-    silverLow: latestRates.silverLow,
+    goldOpen: sourceRates.goldOpen,
+    silverOpen: sourceRates.silverOpen,
+    goldHigh: sourceRates.goldHigh,
+    silverHigh: sourceRates.silverHigh,
+    goldLow: sourceRates.goldLow,
+    silverLow: sourceRates.silverLow,
 
     goldDifference: gDiff,
     silverDifference: sDiff,
@@ -741,27 +804,38 @@ function calculateRates(goldMcx, silverMcx) {
     silver1kg,
     silver10gram: silver1kg != null ? silver1kg / 100 : null,
 
-    lastUpdated: latestRates.lastUpdated,
-    source: latestRates.source,
-    status: latestRates.status,
+    lastUpdated: useRecorded ? sourceRates.lastUpdated : latestRates.lastUpdated,
+    source: useRecorded ? "render-last-recorded" : latestRates.source,
+    status: useRecorded ? "LAST RECORED DATA IS SHOWING BECAUSE TOKEN GOT EXPIED OR INVALID" : latestRates.status,
+    showingLastRecordedData: Boolean(useRecorded),
+    lastRecordedWarning: useRecorded ? "LAST RECORED DATA IS SHOWING BECAUSE TOKEN GOT EXPIED OR INVALID" : null,
+    lastRecordedRatesUpdatedAt,
     liveFeedStatus,
     lastWebSocketMessageAt,
     lastWebSocketPongAt,
     websocketReconnectCount,
     lastHeartbeatCheckAt,
-    tokenNeedsReconnect,
-    tokenLastError,
+    tokenNeedsReconnect: tokenNeedsReconnect || tokenState.expired,
+    tokenLastError: tokenState.expired ? "TOKEN EXPIRED OR NOT WORKING" : tokenLastError,
     tokenAutoRefreshEnabled,
     refreshTokenPresent: Boolean(refreshToken),
     accessTokenExpiresAt,
+    tokenExpiryDisplay: tokenState.label,
+    tokenExpired: tokenState.expired,
+    tokenWorking: tokensWorking(),
     lastAutoRefreshAt,
-    reconnectPath: tokenNeedsReconnect ? "/upstox" : null,
+    reconnectPath: (tokenNeedsReconnect || tokenState.expired) ? "/upstox" : null,
     mongoConnected: Boolean(tokenCollection),
     tokenStorage: activeTokenSource,
-    usingRenderBackupToken: activeTokenSource === "render-env-backup",
-    usingMemoryBackupToken: activeTokenSource === "server-memory-backup",
+    usingRenderBackupToken: activeTokenSource === "render-env-backup" && tokensWorking(),
+    usingMemoryBackupToken: activeTokenSource === "server-memory-backup" && tokensWorking(),
+    renderTokenAccess: activeTokenSource === "render-env-backup" && tokensWorking(),
+    backendMemoryTokenAccess: activeTokenSource === "server-memory-backup" && tokensWorking(),
     mongoWarning: getMongoFallbackMessage(),
     mongoLastError,
+    jwtEnabled: true,
+    adminSession,
+    authVerified: adminSession,
     goldInstrumentKey: GOLD_KEY,
     silverInstrumentKey: SILVER_KEY,
     goldContract: latestRates.goldContract || null,
@@ -868,6 +942,7 @@ async function fetchLastAvailableQuotes() {
       latestRates.source = "upstox-last-quote";
       latestRates.status = "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
       saveCachedRates();
+      recordLastGoodRatesToRender("rest-last-quote");
       broadcast();
       console.log("Last available quotes updated from Upstox REST API.");
       return true;
@@ -1026,6 +1101,7 @@ async function connectUpstox() {
           silver: latestRates.silverMcx,
         });
         saveCachedRates();
+        recordLastGoodRatesToRender("websocket-live");
         broadcast();
       } else if (data?.type === "market_info") {
         latestRates.status = "Market info received. Waiting for live prices.";
@@ -1205,7 +1281,12 @@ app.post("/api/admin/login", (req, res) => {
     ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
     : ["atu:access"];
   const token = signAdminJwt({ role: "admin", purpose, permissions });
-  res.json({ ok: true, token, expiresInSeconds: JWT_EXPIRY_SECONDS, permissions });
+  res.json({ ok: true, token, expiresInSeconds: JWT_EXPIRY_SECONDS, permissions, jwtEnabled:true, adminSession:true, authVerified:true });
+});
+
+
+app.get("/api/admin/session", requireAdminJwt, (req, res) => {
+  res.json({ ok: true, jwtEnabled: true, adminSession: true, authVerified: true, admin: req.admin });
 });
 
 app.post("/api/admin/upstox-login-url", requireAdminJwt, (req, res) => {
@@ -1265,6 +1346,14 @@ app.get("/api/upstox/status", (req, res) => {
     refreshTokenPresent: Boolean(refreshToken),
     tokenAutoRefreshEnabled,
     accessTokenExpiresAt,
+    tokenExpiryDisplay: tokenExpiryState().label,
+    tokenExpired: tokenExpiryState().expired,
+    tokenWorking: tokensWorking(),
+    renderTokenAccess: activeTokenSource === "render-env-backup" && tokensWorking(),
+    backendMemoryTokenAccess: activeTokenSource === "server-memory-backup" && tokensWorking(),
+    jwtEnabled: true,
+    adminSession: false,
+    authVerified: false,
     lastAutoRefreshAt,
     liveFeedStatus,
     lastWebSocketMessageAt,
@@ -1315,7 +1404,7 @@ app.get("/api/upstox/callback", async (req, res) => {
     await fetchLastAvailableQuotes();
     setTimeout(connectUpstox, 1000);
 
-    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">Access token generated successfully</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">TOKEN UPDATED SUCCESSFULLY</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
   } catch (error) {
     const details = JSON.stringify(error.response?.data || error.message);
     console.error("Upstox token exchange failed:", details);
@@ -1338,7 +1427,7 @@ app.get("/api/rates", async (req, res) => {
   res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
 });
 
-app.post("/api/manual-rates", (req, res) => {
+app.post("/api/manual-rates", requireAdminJwt, (req, res) => {
   const gold = Number(req.body.goldMcx);
   const silver = Number(req.body.silverMcx);
   const goldOpen = Number(req.body.goldOpen);
@@ -1361,12 +1450,15 @@ app.post("/api/manual-rates", (req, res) => {
   latestRates.source = "manual";
   latestRates.status = "Manual rates saved.";
   saveCachedRates();
+  recordLastGoodRatesToRender("manual-rates");
   broadcast();
 
   res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx));
 });
 
-app.post("/api/rate-difference", async (req, res) => {
+app.post("/api/rate-difference", requireAdminJwt, async (req, res) => {
+  const permissions = req.admin?.permissions || [];
+  if (!permissions.includes("settings:update")) return res.status(403).json({ ok:false, message:"Settings update permission denied." });
   const hasGold = Object.prototype.hasOwnProperty.call(req.body, "goldDifference");
   const hasSilver = Object.prototype.hasOwnProperty.call(req.body, "silverDifference");
   const goldDiff = Number(req.body.goldDifference);
