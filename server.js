@@ -360,10 +360,21 @@ function rememberAdminSession(token, payload) {
 }
 
 function markRenderTokenActiveIfPossible(renderUpdate) {
+  // MongoDB is the primary token source. Render ENV is only a backup copy.
+  // Earlier this function changed tokenStorage to render-env-backup after every
+  // successful Render sync, which made the API look like it was using Render
+  // even when MongoDB had saved the token. Keep MongoDB as active source when
+  // MongoDB is connected and token is saved there.
+  if (renderUpdate?.updated && accessToken) {
+    process.env.UPSTOX_ACCESS_TOKEN = accessToken;
+  }
+  if (tokenCollection && accessToken) {
+    activeTokenSource = "mongodb";
+    return;
+  }
   if (renderUpdate?.updated) {
     activeTokenSource = "render-env-backup";
-    if (accessToken) process.env.UPSTOX_ACCESS_TOKEN = accessToken;
-  } else if (!tokenCollection && activeTokenSource !== "render-env-backup") {
+  } else if (activeTokenSource !== "render-env-backup") {
     activeTokenSource = "server-memory-backup";
   }
 }
@@ -827,6 +838,8 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     silverMcx: Number.isFinite(silver) ? silver : null,
     goldOpen: sourceRates.goldOpen,
     silverOpen: sourceRates.silverOpen,
+    goldPrevClose: sourceRates.goldPrevClose,
+    silverPrevClose: sourceRates.silverPrevClose,
     goldHigh: sourceRates.goldHigh,
     silverHigh: sourceRates.silverHigh,
     goldLow: sourceRates.goldLow,
@@ -848,9 +861,9 @@ function calculateRates(goldMcx, silverMcx, req = null) {
 
     lastUpdated: useRecorded ? sourceRates.lastUpdated : latestRates.lastUpdated,
     source: useRecorded ? "render-last-recorded" : latestRates.source,
-    status: useRecorded ? "LAST RECORED DATA IS SHOWING BECAUSE TOKEN GOT EXPIED OR INVALID" : latestRates.status,
+    status: useRecorded ? "LAST RECORDED DATA IS SHOWING BECAUSE TOKEN GOT EXPIRED OR INVALID" : latestRates.status,
     showingLastRecordedData: Boolean(useRecorded),
-    lastRecordedWarning: useRecorded ? "LAST RECORED DATA IS SHOWING BECAUSE TOKEN GOT EXPIED OR INVALID" : null,
+    lastRecordedWarning: useRecorded ? "LAST RECORDED DATA IS SHOWING BECAUSE TOKEN GOT EXPIRED OR INVALID" : null,
     lastRecordedRatesUpdatedAt,
     liveFeedStatus,
     lastWebSocketMessageAt,
