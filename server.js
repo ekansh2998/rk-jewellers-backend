@@ -71,6 +71,10 @@ let goldDifference = Number(process.env.GOLD_RATE_DIFFERENCE || 0);
 let silverDifference = Number(process.env.SILVER_RATE_DIFFERENCE || 0);
 let goldDifferenceUpdatedAt = process.env.GOLD_RATE_DIFFERENCE_UPDATED_AT || null;
 let silverDifferenceUpdatedAt = process.env.SILVER_RATE_DIFFERENCE_UPDATED_AT || null;
+let goldDifferenceMcxAtUpdate = Number(process.env.GOLD_RATE_DIFFERENCE_MCX_RATE || 0) || null;
+let silverDifferenceMcxAtUpdate = Number(process.env.SILVER_RATE_DIFFERENCE_MCX_RATE || 0) || null;
+let goldPhysicalRateAtUpdate = Number(process.env.PHYSICAL_GOLD_RATE || 0) || null;
+let silverPhysicalRateAtUpdate = Number(process.env.PHYSICAL_SILVER_RATE || 0) || null;
 
 let GOLD_KEY = null;
 let SILVER_KEY = null;
@@ -942,6 +946,14 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     silverDifference: sDiff,
     goldDifferenceUpdatedAt,
     silverDifferenceUpdatedAt,
+    goldDifferenceMcxAtUpdate,
+    silverDifferenceMcxAtUpdate,
+    goldPhysicalRateAtUpdate,
+    silverPhysicalRateAtUpdate,
+    goldPrevCloseDate: sourceRates.goldPrevCloseDate || latestRates.goldPrevCloseDate || null,
+    silverPrevCloseDate: sourceRates.silverPrevCloseDate || latestRates.silverPrevCloseDate || null,
+    goldThirdLastCloseDate: sourceRates.goldThirdLastCloseDate || latestRates.goldThirdLastCloseDate || null,
+    silverThirdLastCloseDate: sourceRates.silverThirdLastCloseDate || latestRates.silverThirdLastCloseDate || null,
 
     gold24k,
     gold22k: gold24k != null ? gold24k * 0.916 : null,
@@ -1062,14 +1074,16 @@ function applyQuoteFallback(quote, metal) {
   const ltp = Number(quote.last_price ?? quote.ltp ?? quote.lastPrice ?? quote.close ?? quote.cp);
   const ohlc = quote.ohlc || quote.OHLC || quote.day_ohlc || {};
   const open = Number(ohlc.open ?? quote.open);
-  const close = Number(ohlc.close ?? quote.close ?? quote.cp ?? quote.previousClose ?? quote.prev_close);
+  // Do not use quote close/ltp as previous close. Previous/third-last close must come only from daily historical candles.
+  const quotePrevClose = Number(quote.previousClose ?? quote.prev_close ?? quote.prevClose ?? quote.close_price);
   const high = Number(ohlc.high ?? quote.high);
   const low = Number(ohlc.low ?? quote.low);
 
   let updated = false;
   if (Number.isFinite(ltp)) { latestRates[`${metal}Mcx`] = ltp; updated = true; }
   if (Number.isFinite(open)) { latestRates[`${metal}Open`] = open; updated = true; }
-  if (Number.isFinite(close)) { setPreviousCloseWithHistory(metal, close); updated = true; }
+  // Keep quote previous close only as emergency fallback when historical candle close is not available.
+  if (Number.isFinite(quotePrevClose) && quotePrevClose > 0 && !latestRates[`${metal}PrevClose`]) { latestRates[`${metal}PrevClose`] = quotePrevClose; updated = true; }
   if (Number.isFinite(high)) { latestRates[`${metal}High`] = high; updated = true; }
   if (Number.isFinite(low)) { latestRates[`${metal}Low`] = low; updated = true; }
   return updated;
@@ -1133,24 +1147,37 @@ async function fetchDailyCandlesForInstrument(instrumentKey) {
   return [];
 }
 
+function candleDateOnlyIST(ts) {
+  const raw = String(ts || "");
+  const direct = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (direct) return direct[1];
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return null;
+  return getIstDateOnlyString(d);
+}
+
 function applyHistoricalCloses(metal, candles) {
   const todayIst = getIstDateOnlyString();
   const completed = candles
-    .map((c) => ({ ...c, dateOnly: String(c.ts).slice(0, 10) }))
-    .filter((c) => c.dateOnly && c.dateOnly < todayIst)
+    .map((c) => ({ ...c, dateOnly: candleDateOnlyIST(c.ts) }))
+    .filter((c) => c.dateOnly && c.dateOnly < todayIst && Number.isFinite(Number(c.close)) && Number(c.close) > 0)
     .sort((a, b) => String(b.dateOnly).localeCompare(String(a.dateOnly)));
 
-  // completed[0] = previous/last completed trading day close.
-  // completed[1] = third-last trading close as used in this app's market-closed logic.
-  const previousClose = completed[0]?.close;
-  const thirdLastClose = completed[1]?.close;
+  // On 03 Jun, completed[0] must be 02 Jun close and completed[1] must be 01 Jun close.
+  // Today's candle is always ignored to avoid saving current LTP/partial candle as previous close.
+  const previousCandle = completed[0];
+  const thirdLastCandle = completed[1];
+  const previousClose = Number(previousCandle?.close);
+  const thirdLastClose = Number(thirdLastCandle?.close);
   let changed = false;
   if (Number.isFinite(previousClose) && previousClose > 0) {
     latestRates[`${metal}PrevClose`] = previousClose;
+    latestRates[`${metal}PrevCloseDate`] = previousCandle?.dateOnly || null;
     changed = true;
   }
   if (Number.isFinite(thirdLastClose) && thirdLastClose > 0) {
     latestRates[`${metal}ThirdLastClose`] = thirdLastClose;
+    latestRates[`${metal}ThirdLastCloseDate`] = thirdLastCandle?.dateOnly || null;
     changed = true;
   }
   return changed;
@@ -1163,6 +1190,10 @@ async function saveHistoricalClosesToMongo() {
     silverPrevClose: latestRates.silverPrevClose || null,
     goldThirdLastClose: latestRates.goldThirdLastClose || null,
     silverThirdLastClose: latestRates.silverThirdLastClose || null,
+    goldPrevCloseDate: latestRates.goldPrevCloseDate || null,
+    silverPrevCloseDate: latestRates.silverPrevCloseDate || null,
+    goldThirdLastCloseDate: latestRates.goldThirdLastCloseDate || null,
+    silverThirdLastCloseDate: latestRates.silverThirdLastCloseDate || null,
     historicalCloseUpdatedAt: new Date().toISOString(),
   };
   try {
@@ -1762,22 +1793,36 @@ app.post("/api/rate-difference", requireAdminJwt, async (req, res) => {
   if (!permissions.includes("settings:update")) return res.status(403).json({ ok:false, message:"Settings update permission denied." });
   const hasGold = Object.prototype.hasOwnProperty.call(req.body, "goldDifference");
   const hasSilver = Object.prototype.hasOwnProperty.call(req.body, "silverDifference");
-  const goldDiff = Number(req.body.goldDifference);
-  const silverDiff = Number(req.body.silverDifference);
+  let goldDiff = Number(req.body.goldDifference);
+  let silverDiff = Number(req.body.silverDifference);
+  const goldPhysicalRate = Number(req.body.goldPhysicalRate);
+  const silverPhysicalRate = Number(req.body.silverPhysicalRate);
+  const currentGoldMcx = Number(latestRates.goldMcx);
+  const currentSilverMcx = Number(latestRates.silverMcx);
+  if (Number.isFinite(goldPhysicalRate) && goldPhysicalRate >= 0 && Number.isFinite(currentGoldMcx)) goldDiff = goldPhysicalRate - currentGoldMcx;
+  if (Number.isFinite(silverPhysicalRate) && silverPhysicalRate >= 0 && Number.isFinite(currentSilverMcx)) silverDiff = silverPhysicalRate - currentSilverMcx;
 
   const nowIso = new Date().toISOString();
   const renderUpdates = {};
   if (hasGold && Number.isFinite(goldDiff)) {
     goldDifference = goldDiff;
     goldDifferenceUpdatedAt = nowIso;
+    goldDifferenceMcxAtUpdate = Number.isFinite(currentGoldMcx) ? currentGoldMcx : null;
+    if (Number.isFinite(goldPhysicalRate) && goldPhysicalRate >= 0) goldPhysicalRateAtUpdate = goldPhysicalRate;
     renderUpdates.goldDifference = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE", String(goldDiff));
     renderUpdates.goldDifferenceUpdatedAt = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+    renderUpdates.goldDifferenceMcxAtUpdate = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_MCX_RATE", String(goldDifferenceMcxAtUpdate ?? ""));
+    if (goldPhysicalRateAtUpdate != null) renderUpdates.goldPhysicalRateAtUpdate = await updateRenderEnvironmentVariable("PHYSICAL_GOLD_RATE", String(goldPhysicalRateAtUpdate));
   }
   if (hasSilver && Number.isFinite(silverDiff)) {
     silverDifference = silverDiff;
     silverDifferenceUpdatedAt = nowIso;
+    silverDifferenceMcxAtUpdate = Number.isFinite(currentSilverMcx) ? currentSilverMcx : null;
+    if (Number.isFinite(silverPhysicalRate) && silverPhysicalRate >= 0) silverPhysicalRateAtUpdate = silverPhysicalRate;
     renderUpdates.silverDifference = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE", String(silverDiff));
     renderUpdates.silverDifferenceUpdatedAt = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+    renderUpdates.silverDifferenceMcxAtUpdate = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_MCX_RATE", String(silverDifferenceMcxAtUpdate ?? ""));
+    if (silverPhysicalRateAtUpdate != null) renderUpdates.silverPhysicalRateAtUpdate = await updateRenderEnvironmentVariable("PHYSICAL_SILVER_RATE", String(silverPhysicalRateAtUpdate));
   }
 
   latestRates.lastUpdated = nowIso;
