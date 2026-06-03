@@ -294,8 +294,12 @@ function applySavedTokenData(saved, sourceLabel) {
   if (savedGeneratedBy) accessTokenGeneratedBy = savedGeneratedBy;
   if (Number.isFinite(Number(saved.goldPrevClose))) latestRates.goldPrevClose = Number(saved.goldPrevClose);
   if (Number.isFinite(Number(saved.silverPrevClose))) latestRates.silverPrevClose = Number(saved.silverPrevClose);
+  if (saved.goldPrevCloseDate) latestRates.goldPrevCloseDate = saved.goldPrevCloseDate;
+  if (saved.silverPrevCloseDate) latestRates.silverPrevCloseDate = saved.silverPrevCloseDate;
   if (Number.isFinite(Number(saved.goldThirdLastClose))) latestRates.goldThirdLastClose = Number(saved.goldThirdLastClose);
   if (Number.isFinite(Number(saved.silverThirdLastClose))) latestRates.silverThirdLastClose = Number(saved.silverThirdLastClose);
+  if (saved.goldThirdLastCloseDate) latestRates.goldThirdLastCloseDate = saved.goldThirdLastCloseDate;
+  if (saved.silverThirdLastCloseDate) latestRates.silverThirdLastCloseDate = saved.silverThirdLastCloseDate;
 
   if (accessToken) {
     tokenNeedsReconnect = false;
@@ -1073,7 +1077,13 @@ function applyQuoteFallback(quote, metal) {
   let updated = false;
   if (Number.isFinite(ltp)) { latestRates[`${metal}Mcx`] = ltp; updated = true; }
   if (Number.isFinite(open)) { latestRates[`${metal}Open`] = open; updated = true; }
-  if (Number.isFinite(close)) { setPreviousCloseWithHistory(metal, close); updated = true; }
+  // Do NOT update PrevClose/ThirdLastClose from live quote close.
+  // Upstox quote/OHLC close can be today's partial value.
+  // Previous/third-last close must come only from daily historical candles.
+  if (Number.isFinite(close) && !latestRates[`${metal}PrevClose`]) {
+    latestRates[`${metal}PrevClose`] = close;
+    updated = true;
+  }
   if (Number.isFinite(high)) { latestRates[`${metal}High`] = high; updated = true; }
   if (Number.isFinite(low)) { latestRates[`${metal}Low`] = low; updated = true; }
   return updated;
@@ -1090,6 +1100,16 @@ function formatDateYYYYMMDD(date) {
 
 function getIstDateOnlyString(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+
+function candleDateOnlyIST(ts) {
+  if (!ts) return null;
+  if (typeof ts === "string" && /^\d{4}-\d{2}-\d{2}$/.test(ts)) return ts;
+  const d = new Date(ts);
+  if (!Number.isNaN(d.getTime())) return getIstDateOnlyString(d);
+  const text = String(ts);
+  const m = text.match(/(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
 }
 
 function normalizeCandleList(raw) {
@@ -1139,22 +1159,30 @@ async function fetchDailyCandlesForInstrument(instrumentKey) {
 
 function applyHistoricalCloses(metal, candles) {
   const todayIst = getIstDateOnlyString();
+
+  // Use ONLY completed historical daily candles.
+  // If today candle exists, remove it. This fixes wrong values during market hours.
+  // Upstox can return candles in any order, so sort by date descending.
   const completed = candles
-    .map((c) => ({ ...c, dateOnly: String(c.ts).slice(0, 10) }))
-    .filter((c) => c.dateOnly && c.dateOnly < todayIst)
+    .map((c) => ({ ...c, dateOnly: candleDateOnlyIST(c.ts) }))
+    .filter((c) => c.dateOnly && c.dateOnly < todayIst && Number.isFinite(Number(c.close)) && Number(c.close) > 0)
     .sort((a, b) => String(b.dateOnly).localeCompare(String(a.dateOnly)));
 
-  // completed[0] = previous/last completed trading day close.
-  // completed[1] = third-last trading close as used in this app's market-closed logic.
-  const previousClose = completed[0]?.close;
-  const thirdLastClose = completed[1]?.close;
+  // Example: today 2026-06-03
+  // completed[0] = 2026-06-02 close = previous trading day close
+  // completed[1] = 2026-06-01 close = third-last close as requested for market-closed comparison
+  const previousClose = Number(completed[0]?.close);
+  const thirdLastClose = Number(completed[1]?.close);
+
   let changed = false;
   if (Number.isFinite(previousClose) && previousClose > 0) {
     latestRates[`${metal}PrevClose`] = previousClose;
+    latestRates[`${metal}PrevCloseDate`] = completed[0]?.dateOnly || null;
     changed = true;
   }
   if (Number.isFinite(thirdLastClose) && thirdLastClose > 0) {
     latestRates[`${metal}ThirdLastClose`] = thirdLastClose;
+    latestRates[`${metal}ThirdLastCloseDate`] = completed[1]?.dateOnly || null;
     changed = true;
   }
   return changed;
@@ -1167,6 +1195,10 @@ async function saveHistoricalClosesToMongo() {
     silverPrevClose: latestRates.silverPrevClose || null,
     goldThirdLastClose: latestRates.goldThirdLastClose || null,
     silverThirdLastClose: latestRates.silverThirdLastClose || null,
+    goldPrevCloseDate: latestRates.goldPrevCloseDate || null,
+    silverPrevCloseDate: latestRates.silverPrevCloseDate || null,
+    goldThirdLastCloseDate: latestRates.goldThirdLastCloseDate || null,
+    silverThirdLastCloseDate: latestRates.silverThirdLastCloseDate || null,
     historicalCloseUpdatedAt: new Date().toISOString(),
   };
   try {
@@ -1374,13 +1406,13 @@ async function connectUpstox() {
       if (silver != null) latestRates.silverMcx = silver;
       if (goldOhlc) {
         if (goldOhlc.open != null) latestRates.goldOpen = goldOhlc.open;
-        if (goldOhlc.close != null) setPreviousCloseWithHistory("gold", goldOhlc.close);
+        // Do not store gold prev/third close from websocket day close; use historical daily candles only.
         if (goldOhlc.high != null) latestRates.goldHigh = goldOhlc.high;
         if (goldOhlc.low != null) latestRates.goldLow = goldOhlc.low;
       }
       if (silverOhlc) {
         if (silverOhlc.open != null) latestRates.silverOpen = silverOhlc.open;
-        if (silverOhlc.close != null) setPreviousCloseWithHistory("silver", silverOhlc.close);
+        // Do not store silver prev/third close from websocket day close; use historical daily candles only.
         if (silverOhlc.high != null) latestRates.silverHigh = silverOhlc.high;
         if (silverOhlc.low != null) latestRates.silverLow = silverOhlc.low;
       }
