@@ -42,8 +42,11 @@ let mongoLastError = null;
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
 const UPSTOX_REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI || "";
-const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
-const ADMIN_UPDATE_PASSWORD = process.env.ADMIN_UPDATE_PASSWORD || "Widber";
+const ATU_ACCESS_PASSWORD = process.env.ATU_ACCESS_PASSWORD || process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
+const ATU_UPDATE_PASSWORD = process.env.ATU_UPDATE_PASSWORD || process.env.ADMIN_UPDATE_PASSWORD || "Widber";
+const MDR_PASSWORD = process.env.MDR_PASSWORD || process.env.ADMIN_UPDATE_PASSWORD || "Widber";
+const ADMIN_ACCESS_PASSWORD = ATU_ACCESS_PASSWORD;
+const ADMIN_UPDATE_PASSWORD = ATU_UPDATE_PASSWORD;
 const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_JWT_SECRET || crypto.createHash("sha256").update(String(UPSTOX_API_SECRET || UPSTOX_API_KEY || "rk-jewellers-local-secret")).digest("hex");
 const JWT_EXPIRY_SECONDS = Number(process.env.JWT_EXPIRY_SECONDS || 60 * 60);
 
@@ -1595,24 +1598,51 @@ async function updateRenderAccessTokenEnv(newToken) {
   return updateRenderEnvironmentVariable(envKey, newToken);
 }
 
+function queueRenderEnvironmentVariable(envKey, envValue) {
+  process.env[envKey] = String(envValue ?? "");
+  setImmediate(async () => {
+    try {
+      await updateRenderEnvironmentVariable(envKey, envValue);
+    } catch (error) {
+      console.log(`Background Render env sync failed for ${envKey}:`, error.message);
+    }
+  });
+  return { queued: true };
+}
+
 
 
 app.post("/api/admin/login", (req, res) => {
   const password = String(req.body?.password || "");
   const purpose = String(req.body?.purpose || "admin");
-  const isAccessPassword = password === ADMIN_ACCESS_PASSWORD;
-  const isUpdatePassword = password === ADMIN_UPDATE_PASSWORD;
-  if (!isAccessPassword && !isUpdatePassword) {
-    return res.status(401).json({ ok: false, message: "Wrong Password" });
+
+  let permissions = [];
+  if (["settings-update", "mdr", "mdr-update"].includes(purpose)) {
+    if (password !== MDR_PASSWORD && password !== ATU_UPDATE_PASSWORD) {
+      return res.status(401).json({ ok: false, message: "Wrong Password" });
+    }
+    permissions = ["settings:update"];
+  } else if (["token-update", "upstox-reconnect", "token-view", "admin-update"].includes(purpose)) {
+    if (password !== ATU_UPDATE_PASSWORD) {
+      return res.status(401).json({ ok: false, message: "Wrong Password" });
+    }
+    permissions = ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"];
+  } else {
+    if (password === ATU_ACCESS_PASSWORD) {
+      permissions = ["atu:access"];
+    } else if (password === ATU_UPDATE_PASSWORD || password === MDR_PASSWORD) {
+      permissions = ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"];
+    } else {
+      return res.status(401).json({ ok: false, message: "Wrong Password" });
+    }
   }
-  const permissions = isUpdatePassword
-    ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
-    : ["atu:access"];
+
   const token = signAdminJwt({ role: "admin", purpose, permissions });
   const payload = verifyAdminJwt(token);
   rememberAdminSession(token, payload);
   res.json({ ok: true, token, expiresInSeconds: JWT_EXPIRY_SECONDS, permissions, jwtEnabled:true, adminSession:true, authVerified:true, adminSessionExpiresAt: getAdminSessionState(req).adminSessionExpiresAt });
 });
+
 
 
 app.get("/api/admin/session", requireAdminJwt, (req, res) => {
@@ -1632,19 +1662,32 @@ app.post("/api/upstox/manual-token", requireAdminJwt, async (req, res) => {
   const token = String(req.body?.accessToken || "").trim();
   if (!token) return res.status(400).json({ ok: false, message: "Access token is blank." });
   await saveAccessToken({ access_token: token, source: "manual", generatedBy: "manual" });
-  latestRates.status = "Access token manually updated from ATU page.";
+  latestRates.status = "Access token manually updated from ATU page. Fresh rates are syncing.";
   latestRates.source = "atu-token-update";
-  const renderUpdate = await updateRenderAccessTokenEnv(token);
-  markRenderTokenActiveIfPossible(renderUpdate);
-  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
-  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
-  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
-  try { await fetchLastAvailableQuotes(); } catch {}
-  try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
-  setTimeout(connectUpstox, 1000);
+  tokenNeedsReconnect = false;
+  tokenLastError = null;
   broadcast();
-  res.json({ ok: true, savedToMongoDB: Boolean(tokenCollection), savedToServerFile: true, renderEnvironment: renderUpdate, accessTokenExpiresAt });
+
+  // Respond quickly to the mobile app. Render ENV sync and live feed restart happen in background.
+  res.json({ ok: true, savedToMongoDB: Boolean(tokenCollection), savedToServerFile: true, renderEnvironment: { queued: true }, accessTokenExpiresAt });
+
+  setImmediate(async () => {
+    try {
+      const renderUpdate = await updateRenderAccessTokenEnv(token);
+      markRenderTokenActiveIfPossible(renderUpdate);
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
+    } catch (e) {
+      console.log("Background manual token Render sync failed:", e.message);
+    }
+  });
+
+  fetchLastAvailableQuotes().catch(() => {});
+  try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
+  setTimeout(connectUpstox, 300);
 });
+
 
 
 app.get("/api/upstox/current-token", requireAdminJwt, (req, res) => {
@@ -1729,25 +1772,17 @@ app.get("/api/upstox/callback", async (req, res) => {
 
     await saveAccessToken({ ...response.data, source: "reconnect-to-upstox", generatedBy: "reconnect-to-upstox" });
     const newTokenFromReconnect = response.data?.access_token || response.data?.accessToken;
+    if (newTokenFromReconnect) {
+      const renderUpdate = await updateRenderAccessTokenEnv(newTokenFromReconnect);
+      markRenderTokenActiveIfPossible(renderUpdate);
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
+      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
+    }
     latestRates.status = "Upstox reconnected successfully. Fetching latest rates.";
     latestRates.source = "upstox-reconnected";
-    fetchLastAvailableQuotes().catch(() => {});
-    setTimeout(connectUpstox, 500);
-
-    // Slow Render ENV sync runs in background so reconnect page responds quickly.
-    if (newTokenFromReconnect) {
-      setImmediate(async () => {
-        try {
-          const renderUpdate = await updateRenderAccessTokenEnv(newTokenFromReconnect);
-          markRenderTokenActiveIfPossible(renderUpdate);
-          try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
-          try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
-          try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
-        } catch (e) {
-          console.log("Background reconnect token sync failed:", e.message);
-        }
-      });
-    }
+    await fetchLastAvailableQuotes();
+    setTimeout(connectUpstox, 1000);
 
     res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">TOKEN UPDATED SUCCESSFULLY</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
   } catch (error) {
@@ -1766,25 +1801,9 @@ app.get("/rates", (req, res) => {
 });
 
 app.get("/api/rates", async (req, res) => {
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-
   if (!GOLD_KEY || !SILVER_KEY) {
     await prepareInstrumentKeys();
   }
-
-  const forceFresh = String(req.query?.fresh || "0") === "1";
-  const lastMs = latestRates.lastUpdated ? new Date(latestRates.lastUpdated).getTime() : 0;
-  const staleMs = lastMs ? Date.now() - lastMs : Infinity;
-
-  // On app open, wait briefly for a fresh REST quote instead of immediately returning old cache.
-  // This removes the 20-60 second old-data feeling when the app is opened again.
-  if (forceFresh || !lastMs || staleMs > 5000) {
-    try { await fetchLastAvailableQuotes(); } catch {}
-  }
-
-  refreshHistoricalTradingCloses(false).catch(() => {});
   res.json(calculateRates(latestRates.goldMcx, latestRates.silverMcx, req));
 });
 
@@ -1853,10 +1872,10 @@ app.post("/api/rate-difference", requireAdminJwt, async (req, res) => {
     goldDifferenceUpdatedAt = nowIso;
     goldDifferenceMcxAtUpdate = Number.isFinite(currentGoldMcx) ? currentGoldMcx : null;
 
-    renderUpdates.goldDifference = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE", String(finalGoldDiff));
-    renderUpdates.goldDifferenceUpdatedAt = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+    renderUpdates.goldDifference = queueRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE", String(finalGoldDiff));
+    renderUpdates.goldDifferenceUpdatedAt = queueRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_UPDATED_AT", nowIso);
     if (goldDifferenceMcxAtUpdate != null) {
-      renderUpdates.goldDifferenceMcxAtUpdate = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_MCX_AT_UPDATE", String(goldDifferenceMcxAtUpdate));
+      renderUpdates.goldDifferenceMcxAtUpdate = queueRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_MCX_AT_UPDATE", String(goldDifferenceMcxAtUpdate));
     }
 
     if (tokenCollection) {
@@ -1895,10 +1914,10 @@ app.post("/api/rate-difference", requireAdminJwt, async (req, res) => {
     silverDifferenceUpdatedAt = nowIso;
     silverDifferenceMcxAtUpdate = Number.isFinite(currentSilverMcx) ? currentSilverMcx : null;
 
-    renderUpdates.silverDifference = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE", String(finalSilverDiff));
-    renderUpdates.silverDifferenceUpdatedAt = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+    renderUpdates.silverDifference = queueRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE", String(finalSilverDiff));
+    renderUpdates.silverDifferenceUpdatedAt = queueRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_UPDATED_AT", nowIso);
     if (silverDifferenceMcxAtUpdate != null) {
-      renderUpdates.silverDifferenceMcxAtUpdate = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_MCX_AT_UPDATE", String(silverDifferenceMcxAtUpdate));
+      renderUpdates.silverDifferenceMcxAtUpdate = queueRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_MCX_AT_UPDATE", String(silverDifferenceMcxAtUpdate));
     }
 
     if (tokenCollection) {
