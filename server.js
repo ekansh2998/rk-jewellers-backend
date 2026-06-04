@@ -42,8 +42,9 @@ let mongoLastError = null;
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
 const UPSTOX_REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI || "";
-const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
-const ADMIN_UPDATE_PASSWORD = process.env.ADMIN_UPDATE_PASSWORD || "Widber";
+const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || process.env.ATU_ACCESS_PASSWORD || "";
+const ADMIN_UPDATE_PASSWORD = process.env.ADMIN_UPDATE_PASSWORD || process.env.ATU_UPDATE_PASSWORD || "";
+const MDR_PASSWORD = process.env.MDR_PASSWORD || process.env.ADMIN_MDR_PASSWORD || ADMIN_UPDATE_PASSWORD || "";
 const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_JWT_SECRET || crypto.createHash("sha256").update(String(UPSTOX_API_SECRET || UPSTOX_API_KEY || "rk-jewellers-local-secret")).digest("hex");
 const JWT_EXPIRY_SECONDS = Number(process.env.JWT_EXPIRY_SECONDS || 60 * 60);
 
@@ -1600,14 +1601,15 @@ async function updateRenderAccessTokenEnv(newToken) {
 app.post("/api/admin/login", (req, res) => {
   const password = String(req.body?.password || "");
   const purpose = String(req.body?.purpose || "admin");
-  const isAccessPassword = password === ADMIN_ACCESS_PASSWORD;
-  const isUpdatePassword = password === ADMIN_UPDATE_PASSWORD;
-  if (!isAccessPassword && !isUpdatePassword) {
+  const isAccessPassword = Boolean(ADMIN_ACCESS_PASSWORD) && password === ADMIN_ACCESS_PASSWORD;
+  const isUpdatePassword = Boolean(ADMIN_UPDATE_PASSWORD) && password === ADMIN_UPDATE_PASSWORD;
+  const isMdrPassword = Boolean(MDR_PASSWORD) && password === MDR_PASSWORD;
+  if (!isAccessPassword && !isUpdatePassword && !isMdrPassword) {
     return res.status(401).json({ ok: false, message: "Wrong Password" });
   }
   const permissions = isUpdatePassword
     ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
-    : ["atu:access"];
+    : (isMdrPassword ? ["settings:update"] : ["atu:access"]);
   const token = signAdminJwt({ role: "admin", purpose, permissions });
   const payload = verifyAdminJwt(token);
   rememberAdminSession(token, payload);
