@@ -42,11 +42,8 @@ let mongoLastError = null;
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
 const UPSTOX_REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI || "";
-const ATU_ACCESS_PASSWORD = process.env.ATU_ACCESS_PASSWORD || process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
-const ATU_UPDATE_PASSWORD = process.env.ATU_UPDATE_PASSWORD || process.env.ADMIN_UPDATE_PASSWORD || "Widber";
-const MDR_PASSWORD = process.env.MDR_PASSWORD || process.env.ADMIN_UPDATE_PASSWORD || "Widber";
-const ADMIN_ACCESS_PASSWORD = ATU_ACCESS_PASSWORD;
-const ADMIN_UPDATE_PASSWORD = ATU_UPDATE_PASSWORD;
+const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
+const ADMIN_UPDATE_PASSWORD = process.env.ADMIN_UPDATE_PASSWORD || "Widber";
 const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_JWT_SECRET || crypto.createHash("sha256").update(String(UPSTOX_API_SECRET || UPSTOX_API_KEY || "rk-jewellers-local-secret")).digest("hex");
 const JWT_EXPIRY_SECONDS = Number(process.env.JWT_EXPIRY_SECONDS || 60 * 60);
 
@@ -173,43 +170,56 @@ function getIstClockParts() {
     hour12: false,
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
   }).formatToParts(new Date());
   const hour = Number(parts.find((p) => p.type === "hour")?.value || 0);
   const minute = Number(parts.find((p) => p.type === "minute")?.value || 0);
-  return { hour, minute };
+  const second = Number(parts.find((p) => p.type === "second")?.value || 0);
+  return { hour, minute, second };
 }
 
 let marketClosedAfter1159 = false;
 let marketClosedBaselineGold = null;
 let marketClosedBaselineSilver = null;
+let marketClosedDisabledByLiveMove = false;
 
 function isAfter1159PmOrOvernightIst() {
-  const { hour, minute } = getIstClockParts();
-  // Start showing the closed state after 11:59 PM and keep it during the overnight period
-  // until a fresh gold/silver tick changes the MCX rate.
-  return (hour === 23 && minute >= 59) || hour < 9;
+  const { hour, minute, second } = getIstClockParts();
+  // Show MARKET CLOSED only inside the requested closing window: 11:59:00 PM to 11:59:50 PM IST.
+  return hour === 23 && minute === 59 && second <= 50;
 }
 
 function refreshMarketClosedState() {
-  if (isAfter1159PmOrOvernightIst() && !marketClosedAfter1159) {
+  const closeWindowActive = isAfter1159PmOrOvernightIst();
+  if (!closeWindowActive) {
+    marketClosedAfter1159 = false;
+    marketClosedBaselineGold = null;
+    marketClosedBaselineSilver = null;
+    marketClosedDisabledByLiveMove = false;
+  }
+  if (closeWindowActive && !marketClosedDisabledByLiveMove && !marketClosedAfter1159) {
     marketClosedAfter1159 = true;
     marketClosedBaselineGold = Number.isFinite(Number(latestRates.goldMcx)) ? Number(latestRates.goldMcx) : null;
     marketClosedBaselineSilver = Number.isFinite(Number(latestRates.silverMcx)) ? Number(latestRates.silverMcx) : null;
   }
-  latestRates.marketClosed = Boolean(marketClosedAfter1159);
-  latestRates.marketClosedMessage = marketClosedAfter1159 ? "MARKET CLOSED" : null;
-  latestRates.marketClosedReferenceMode = marketClosedAfter1159 ? "third-last-trading-close" : "previous-trading-close";
+  latestRates.marketClosed = Boolean(closeWindowActive && !marketClosedDisabledByLiveMove && marketClosedAfter1159);
+  latestRates.marketClosedMessage = latestRates.marketClosed ? "MARKET CLOSED" : null;
+  latestRates.marketClosedReferenceMode = latestRates.marketClosed ? "third-last-trading-close" : "previous-trading-close";
   return latestRates.marketClosed;
 }
 
-function clearMarketClosedIfRateChanged(nextGold, nextSilver) {
-  if (!marketClosedAfter1159) return;
+function clearMarketClosedIfRateChanged(nextGold, nextSilver, previousGold = latestRates.goldMcx, previousSilver = latestRates.silverMcx) {
   const g = Number(nextGold);
   const s = Number(nextSilver);
-  const goldChanged = Number.isFinite(g) && marketClosedBaselineGold != null && g !== marketClosedBaselineGold;
-  const silverChanged = Number.isFinite(s) && marketClosedBaselineSilver != null && s !== marketClosedBaselineSilver;
-  if (goldChanged || silverChanged) {
+  const pg = Number(previousGold);
+  const ps = Number(previousSilver);
+  const goldChanged = Number.isFinite(g) && Number.isFinite(pg) && g !== pg;
+  const silverChanged = Number.isFinite(s) && Number.isFinite(ps) && s !== ps;
+  const baselineGoldChanged = Number.isFinite(g) && marketClosedBaselineGold != null && g !== marketClosedBaselineGold;
+  const baselineSilverChanged = Number.isFinite(s) && marketClosedBaselineSilver != null && s !== marketClosedBaselineSilver;
+  if (goldChanged || silverChanged || baselineGoldChanged || baselineSilverChanged) {
     marketClosedAfter1159 = false;
+    marketClosedDisabledByLiveMove = true;
     marketClosedBaselineGold = null;
     marketClosedBaselineSilver = null;
     latestRates.marketClosed = false;
@@ -1257,12 +1267,17 @@ async function fetchLastAvailableQuotes() {
 
     const goldQuote = pickQuoteObject(response.data, GOLD_KEY);
     const silverQuote = pickQuoteObject(response.data, SILVER_KEY);
+    const previousGoldMcx = latestRates.goldMcx;
+    const previousSilverMcx = latestRates.silverMcx;
     const updatedGold = applyQuoteFallback(goldQuote, "gold");
     const updatedSilver = applyQuoteFallback(silverQuote, "silver");
+    const goldRateChanged = Number.isFinite(Number(latestRates.goldMcx)) && Number(latestRates.goldMcx) !== Number(previousGoldMcx);
+    const silverRateChanged = Number.isFinite(Number(latestRates.silverMcx)) && Number(latestRates.silverMcx) !== Number(previousSilverMcx);
+    clearMarketClosedIfRateChanged(latestRates.goldMcx, latestRates.silverMcx, previousGoldMcx, previousSilverMcx);
 
     if (updatedGold || updatedSilver) {
       refreshMarketClosedState();
-      latestRates.lastUpdated = new Date().toISOString();
+      if (goldRateChanged || silverRateChanged || !latestRates.lastUpdated) latestRates.lastUpdated = new Date().toISOString();
       latestRates.source = "upstox-last-quote";
       latestRates.status = "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
       await refreshHistoricalTradingCloses(false);
@@ -1404,7 +1419,13 @@ async function connectUpstox() {
       const goldOhlc = extractDayOhlcFromFeed(data, GOLD_KEY);
       const silverOhlc = extractDayOhlcFromFeed(data, SILVER_KEY);
 
-      clearMarketClosedIfRateChanged(gold ?? latestRates.goldMcx, silver ?? latestRates.silverMcx);
+      const previousGoldMcx = latestRates.goldMcx;
+      const previousSilverMcx = latestRates.silverMcx;
+      const nextGoldMcx = gold != null ? gold : latestRates.goldMcx;
+      const nextSilverMcx = silver != null ? silver : latestRates.silverMcx;
+      clearMarketClosedIfRateChanged(nextGoldMcx, nextSilverMcx, previousGoldMcx, previousSilverMcx);
+      const goldRateChanged = gold != null && Number(gold) !== Number(previousGoldMcx);
+      const silverRateChanged = silver != null && Number(silver) !== Number(previousSilverMcx);
       if (gold != null) latestRates.goldMcx = gold;
       if (silver != null) latestRates.silverMcx = silver;
       if (goldOhlc) {
@@ -1422,7 +1443,7 @@ async function connectUpstox() {
 
       if (gold != null || silver != null || goldOhlc || silverOhlc) {
         refreshMarketClosedState();
-        latestRates.lastUpdated = new Date().toISOString();
+        if (goldRateChanged || silverRateChanged || !latestRates.lastUpdated) latestRates.lastUpdated = new Date().toISOString();
         latestRates.source = "upstox";
         latestRates.status = "Live rates updated.";
         console.log("Live rates updated:", {
@@ -1598,51 +1619,24 @@ async function updateRenderAccessTokenEnv(newToken) {
   return updateRenderEnvironmentVariable(envKey, newToken);
 }
 
-function queueRenderEnvironmentVariable(envKey, envValue) {
-  process.env[envKey] = String(envValue ?? "");
-  setImmediate(async () => {
-    try {
-      await updateRenderEnvironmentVariable(envKey, envValue);
-    } catch (error) {
-      console.log(`Background Render env sync failed for ${envKey}:`, error.message);
-    }
-  });
-  return { queued: true };
-}
-
 
 
 app.post("/api/admin/login", (req, res) => {
   const password = String(req.body?.password || "");
   const purpose = String(req.body?.purpose || "admin");
-
-  let permissions = [];
-  if (["settings-update", "mdr", "mdr-update"].includes(purpose)) {
-    if (password !== MDR_PASSWORD && password !== ATU_UPDATE_PASSWORD) {
-      return res.status(401).json({ ok: false, message: "Wrong Password" });
-    }
-    permissions = ["settings:update"];
-  } else if (["token-update", "upstox-reconnect", "token-view", "admin-update"].includes(purpose)) {
-    if (password !== ATU_UPDATE_PASSWORD) {
-      return res.status(401).json({ ok: false, message: "Wrong Password" });
-    }
-    permissions = ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"];
-  } else {
-    if (password === ATU_ACCESS_PASSWORD) {
-      permissions = ["atu:access"];
-    } else if (password === ATU_UPDATE_PASSWORD || password === MDR_PASSWORD) {
-      permissions = ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"];
-    } else {
-      return res.status(401).json({ ok: false, message: "Wrong Password" });
-    }
+  const isAccessPassword = password === ADMIN_ACCESS_PASSWORD;
+  const isUpdatePassword = password === ADMIN_UPDATE_PASSWORD;
+  if (!isAccessPassword && !isUpdatePassword) {
+    return res.status(401).json({ ok: false, message: "Wrong Password" });
   }
-
+  const permissions = isUpdatePassword
+    ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
+    : ["atu:access"];
   const token = signAdminJwt({ role: "admin", purpose, permissions });
   const payload = verifyAdminJwt(token);
   rememberAdminSession(token, payload);
   res.json({ ok: true, token, expiresInSeconds: JWT_EXPIRY_SECONDS, permissions, jwtEnabled:true, adminSession:true, authVerified:true, adminSessionExpiresAt: getAdminSessionState(req).adminSessionExpiresAt });
 });
-
 
 
 app.get("/api/admin/session", requireAdminJwt, (req, res) => {
@@ -1662,32 +1656,19 @@ app.post("/api/upstox/manual-token", requireAdminJwt, async (req, res) => {
   const token = String(req.body?.accessToken || "").trim();
   if (!token) return res.status(400).json({ ok: false, message: "Access token is blank." });
   await saveAccessToken({ access_token: token, source: "manual", generatedBy: "manual" });
-  latestRates.status = "Access token manually updated from ATU page. Fresh rates are syncing.";
+  latestRates.status = "Access token manually updated from ATU page.";
   latestRates.source = "atu-token-update";
-  tokenNeedsReconnect = false;
-  tokenLastError = null;
-  broadcast();
-
-  // Respond quickly to the mobile app. Render ENV sync and live feed restart happen in background.
-  res.json({ ok: true, savedToMongoDB: Boolean(tokenCollection), savedToServerFile: true, renderEnvironment: { queued: true }, accessTokenExpiresAt });
-
-  setImmediate(async () => {
-    try {
-      const renderUpdate = await updateRenderAccessTokenEnv(token);
-      markRenderTokenActiveIfPossible(renderUpdate);
-      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
-      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
-      try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
-    } catch (e) {
-      console.log("Background manual token Render sync failed:", e.message);
-    }
-  });
-
-  fetchLastAvailableQuotes().catch(() => {});
+  const renderUpdate = await updateRenderAccessTokenEnv(token);
+  markRenderTokenActiveIfPossible(renderUpdate);
+  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
+  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
+  try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
+  try { await fetchLastAvailableQuotes(); } catch {}
   try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
-  setTimeout(connectUpstox, 300);
+  setTimeout(connectUpstox, 1000);
+  broadcast();
+  res.json({ ok: true, savedToMongoDB: Boolean(tokenCollection), savedToServerFile: true, renderEnvironment: renderUpdate, accessTokenExpiresAt });
 });
-
 
 
 app.get("/api/upstox/current-token", requireAdminJwt, (req, res) => {
@@ -1784,7 +1765,7 @@ app.get("/api/upstox/callback", async (req, res) => {
     await fetchLastAvailableQuotes();
     setTimeout(connectUpstox, 1000);
 
-    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">TOKEN UPDATED SUCCESSFULLY</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">TOKEN GENERATED SUCCESSFULLY</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
   } catch (error) {
     const details = JSON.stringify(error.response?.data || error.message);
     console.error("Upstox token exchange failed:", details);
@@ -1872,10 +1853,10 @@ app.post("/api/rate-difference", requireAdminJwt, async (req, res) => {
     goldDifferenceUpdatedAt = nowIso;
     goldDifferenceMcxAtUpdate = Number.isFinite(currentGoldMcx) ? currentGoldMcx : null;
 
-    renderUpdates.goldDifference = queueRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE", String(finalGoldDiff));
-    renderUpdates.goldDifferenceUpdatedAt = queueRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+    renderUpdates.goldDifference = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE", String(finalGoldDiff));
+    renderUpdates.goldDifferenceUpdatedAt = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_UPDATED_AT", nowIso);
     if (goldDifferenceMcxAtUpdate != null) {
-      renderUpdates.goldDifferenceMcxAtUpdate = queueRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_MCX_AT_UPDATE", String(goldDifferenceMcxAtUpdate));
+      renderUpdates.goldDifferenceMcxAtUpdate = await updateRenderEnvironmentVariable("GOLD_RATE_DIFFERENCE_MCX_AT_UPDATE", String(goldDifferenceMcxAtUpdate));
     }
 
     if (tokenCollection) {
@@ -1914,10 +1895,10 @@ app.post("/api/rate-difference", requireAdminJwt, async (req, res) => {
     silverDifferenceUpdatedAt = nowIso;
     silverDifferenceMcxAtUpdate = Number.isFinite(currentSilverMcx) ? currentSilverMcx : null;
 
-    renderUpdates.silverDifference = queueRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE", String(finalSilverDiff));
-    renderUpdates.silverDifferenceUpdatedAt = queueRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_UPDATED_AT", nowIso);
+    renderUpdates.silverDifference = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE", String(finalSilverDiff));
+    renderUpdates.silverDifferenceUpdatedAt = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_UPDATED_AT", nowIso);
     if (silverDifferenceMcxAtUpdate != null) {
-      renderUpdates.silverDifferenceMcxAtUpdate = queueRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_MCX_AT_UPDATE", String(silverDifferenceMcxAtUpdate));
+      renderUpdates.silverDifferenceMcxAtUpdate = await updateRenderEnvironmentVariable("SILVER_RATE_DIFFERENCE_MCX_AT_UPDATE", String(silverDifferenceMcxAtUpdate));
     }
 
     if (tokenCollection) {
