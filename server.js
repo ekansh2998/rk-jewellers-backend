@@ -42,8 +42,9 @@ let mongoLastError = null;
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
 const UPSTOX_REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI || "";
-const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
-const ADMIN_UPDATE_PASSWORD = process.env.ADMIN_UPDATE_PASSWORD || "Widber";
+const ADMIN_ACCESS_PASSWORD = process.env.ATU_ACCESS_PASSWORD || process.env.ADMIN_ACCESS_PASSWORD || "Ekansh2998";
+const ADMIN_UPDATE_PASSWORD = process.env.ATU_UPDATE_PASSWORD || process.env.ADMIN_UPDATE_PASSWORD || "Widber";
+const MDR_PASSWORD = process.env.MDR_PASSWORD || "Widber";
 const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_JWT_SECRET || crypto.createHash("sha256").update(String(UPSTOX_API_SECRET || UPSTOX_API_KEY || "rk-jewellers-local-secret")).digest("hex");
 const JWT_EXPIRY_SECONDS = Number(process.env.JWT_EXPIRY_SECONDS || 60 * 60);
 
@@ -185,8 +186,16 @@ let marketClosedDisabledByLiveMove = false;
 
 function isAfter1159PmOrOvernightIst() {
   const { hour, minute, second } = getIstClockParts();
-  // Show MARKET CLOSED only inside the requested closing window: 11:59:00 PM to 11:59:50 PM IST.
-  return hour === 23 && minute === 59 && second <= 50;
+
+  if (hour === 23 && minute === 59 && second >= 50) {
+    return true;
+  }
+
+  if (marketClosedAfter1159 && !marketClosedDisabledByLiveMove) {
+    return true;
+  }
+
+  return false;
 }
 
 function refreshMarketClosedState() {
@@ -213,8 +222,8 @@ function clearMarketClosedIfRateChanged(nextGold, nextSilver, previousGold = lat
   const s = Number(nextSilver);
   const pg = Number(previousGold);
   const ps = Number(previousSilver);
-  const goldChanged = Number.isFinite(g) && Number.isFinite(pg) && g !== pg;
-  const silverChanged = Number.isFinite(s) && Number.isFinite(ps) && s !== ps;
+  const goldChanged = Number.isFinite(g) && Number.isFinite(pg) && Math.abs(g - pg) > 0;
+  const silverChanged = Number.isFinite(s) && Number.isFinite(ps) && Math.abs(s - ps) > 0;
   const baselineGoldChanged = Number.isFinite(g) && marketClosedBaselineGold != null && g !== marketClosedBaselineGold;
   const baselineSilverChanged = Number.isFinite(s) && marketClosedBaselineSilver != null && s !== marketClosedBaselineSilver;
   if (goldChanged || silverChanged || baselineGoldChanged || baselineSilverChanged) {
@@ -1624,14 +1633,37 @@ async function updateRenderAccessTokenEnv(newToken) {
 app.post("/api/admin/login", (req, res) => {
   const password = String(req.body?.password || "");
   const purpose = String(req.body?.purpose || "admin");
-  const isAccessPassword = password === ADMIN_ACCESS_PASSWORD;
-  const isUpdatePassword = password === ADMIN_UPDATE_PASSWORD;
-  if (!isAccessPassword && !isUpdatePassword) {
-    return res.status(401).json({ ok: false, message: "Wrong Password" });
+  let permissions = [];
+
+  if (purpose === "mdr-access" || purpose === "settings-update") {
+    if (password !== MDR_PASSWORD) {
+      return res.status(401).json({ ok: false, message: "Wrong Password" });
+    }
+    permissions = ["settings:update"];
+  } else if (purpose === "atu-access") {
+    if (password !== ADMIN_ACCESS_PASSWORD) {
+      return res.status(401).json({ ok: false, message: "Wrong Password" });
+    }
+    permissions = ["atu:access"];
+  } else if (["token-update", "upstox-reconnect", "token-view"].includes(purpose)) {
+    if (password !== ADMIN_UPDATE_PASSWORD) {
+      return res.status(401).json({ ok: false, message: "Wrong Password" });
+    }
+    permissions = ["atu:access", "token:view", "token:update", "upstox:reconnect"];
+  } else {
+    const isAccessPassword = password === ADMIN_ACCESS_PASSWORD;
+    const isUpdatePassword = password === ADMIN_UPDATE_PASSWORD;
+    const isMdrPassword = password === MDR_PASSWORD;
+    if (!isAccessPassword && !isUpdatePassword && !isMdrPassword) {
+      return res.status(401).json({ ok: false, message: "Wrong Password" });
+    }
+    permissions = isUpdatePassword
+      ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
+      : isMdrPassword
+        ? ["settings:update"]
+        : ["atu:access"];
   }
-  const permissions = isUpdatePassword
-    ? ["atu:access", "token:view", "token:update", "upstox:reconnect", "settings:update"]
-    : ["atu:access"];
+
   const token = signAdminJwt({ role: "admin", purpose, permissions });
   const payload = verifyAdminJwt(token);
   rememberAdminSession(token, payload);
