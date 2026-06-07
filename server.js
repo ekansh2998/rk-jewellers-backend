@@ -183,6 +183,8 @@ let marketClosedAfter1159 = false;
 let marketClosedBaselineGold = null;
 let marketClosedBaselineSilver = null;
 let marketClosedDisabledByLiveMove = false;
+let currentDayCandleMissing = false;
+let currentDayCandleCheckAt = null;
 
 function isAfter1159PmOrOvernightIst() {
   const { hour, minute, second } = getIstClockParts();
@@ -199,21 +201,28 @@ function isAfter1159PmOrOvernightIst() {
 }
 
 function refreshMarketClosedState() {
-  const closeWindowActive = isAfter1159PmOrOvernightIst();
-  if (!closeWindowActive) {
+  const timeCloseWindowActive = isAfter1159PmOrOvernightIst();
+  const candleCloseActive = Boolean(currentDayCandleMissing);
+
+  if (!timeCloseWindowActive) {
     marketClosedAfter1159 = false;
     marketClosedBaselineGold = null;
     marketClosedBaselineSilver = null;
     marketClosedDisabledByLiveMove = false;
   }
-  if (closeWindowActive && !marketClosedDisabledByLiveMove && !marketClosedAfter1159) {
+
+  if (timeCloseWindowActive && !marketClosedDisabledByLiveMove && !marketClosedAfter1159) {
     marketClosedAfter1159 = true;
     marketClosedBaselineGold = Number.isFinite(Number(latestRates.goldMcx)) ? Number(latestRates.goldMcx) : null;
     marketClosedBaselineSilver = Number.isFinite(Number(latestRates.silverMcx)) ? Number(latestRates.silverMcx) : null;
   }
-  latestRates.marketClosed = Boolean(closeWindowActive && !marketClosedDisabledByLiveMove && marketClosedAfter1159);
+
+  const timeClosed = Boolean(timeCloseWindowActive && !marketClosedDisabledByLiveMove && marketClosedAfter1159);
+  latestRates.marketClosed = Boolean(timeClosed || candleCloseActive);
   latestRates.marketClosedMessage = latestRates.marketClosed ? "MARKET CLOSED" : null;
   latestRates.marketClosedReferenceMode = latestRates.marketClosed ? "third-last-trading-close" : "previous-trading-close";
+  latestRates.currentDayCandleMissing = currentDayCandleMissing;
+  latestRates.currentDayCandleCheckAt = currentDayCandleCheckAt;
   return latestRates.marketClosed;
 }
 
@@ -1179,6 +1188,17 @@ async function fetchDailyCandlesForInstrument(instrumentKey) {
   return [];
 }
 
+function updateCurrentDayCandleStatus(goldCandles = [], silverCandles = []) {
+  const todayIst = getIstDateOnlyString();
+  const hasGoldToday = goldCandles.some((c) => candleDateOnlyIST(c.ts) === todayIst);
+  const hasSilverToday = silverCandles.some((c) => candleDateOnlyIST(c.ts) === todayIst);
+  currentDayCandleMissing = !(hasGoldToday || hasSilverToday);
+  currentDayCandleCheckAt = new Date().toISOString();
+  latestRates.currentDayCandleMissing = currentDayCandleMissing;
+  latestRates.currentDayCandleCheckAt = currentDayCandleCheckAt;
+  refreshMarketClosedState();
+}
+
 function applyHistoricalCloses(metal, candles) {
   const todayIst = getIstDateOnlyString();
 
@@ -1241,6 +1261,7 @@ async function refreshHistoricalTradingCloses(force = false) {
       fetchDailyCandlesForInstrument(GOLD_KEY),
       fetchDailyCandlesForInstrument(SILVER_KEY),
     ]);
+    updateCurrentDayCandleStatus(goldCandles, silverCandles);
     const goldChanged = applyHistoricalCloses("gold", goldCandles);
     const silverChanged = applyHistoricalCloses("silver", silverCandles);
     if (goldChanged || silverChanged) {
