@@ -200,9 +200,29 @@ function isAfter1159PmOrOvernightIst() {
   return false;
 }
 
+function hasRecentLiveRateActivity(maxAgeMs = 2 * 60 * 1000) {
+  const t = latestRates.lastUpdated ? new Date(latestRates.lastUpdated).getTime() : 0;
+  return Number.isFinite(t) && t > 0 && Date.now() - t <= maxAgeMs && ["upstox", "upstox-last-quote", "atu-token-update", "upstox-reconnected"].includes(latestRates.source);
+}
+
+function markMarketOpenFromLive(reason = "live-rate") {
+  // If Upstox is giving a live/last quote now, the market must not stay closed
+  // only because today's daily candle is missing or delayed.
+  currentDayCandleMissing = false;
+  latestRates.currentDayCandleMissing = false;
+  marketClosedAfter1159 = false;
+  marketClosedDisabledByLiveMove = true;
+  marketClosedBaselineGold = null;
+  marketClosedBaselineSilver = null;
+  latestRates.marketClosed = false;
+  latestRates.marketClosedMessage = null;
+  latestRates.marketClosedReferenceMode = "previous-trading-close";
+  latestRates.marketOpenDetectedBy = reason;
+}
+
 function refreshMarketClosedState() {
   const timeCloseWindowActive = isAfter1159PmOrOvernightIst();
-  const candleCloseActive = Boolean(currentDayCandleMissing);
+  const candleCloseActive = Boolean(currentDayCandleMissing && !hasRecentLiveRateActivity());
 
   if (!timeCloseWindowActive) {
     marketClosedAfter1159 = false;
@@ -236,13 +256,7 @@ function clearMarketClosedIfRateChanged(nextGold, nextSilver, previousGold = lat
   const baselineGoldChanged = Number.isFinite(g) && marketClosedBaselineGold != null && g !== marketClosedBaselineGold;
   const baselineSilverChanged = Number.isFinite(s) && marketClosedBaselineSilver != null && s !== marketClosedBaselineSilver;
   if (goldChanged || silverChanged || baselineGoldChanged || baselineSilverChanged) {
-    marketClosedAfter1159 = false;
-    marketClosedDisabledByLiveMove = true;
-    marketClosedBaselineGold = null;
-    marketClosedBaselineSilver = null;
-    latestRates.marketClosed = false;
-    latestRates.marketClosedMessage = null;
-    latestRates.marketClosedReferenceMode = "previous-trading-close";
+    markMarketOpenFromLive("rate-change");
   }
 }
 
@@ -1306,6 +1320,7 @@ async function fetchLastAvailableQuotes() {
     clearMarketClosedIfRateChanged(latestRates.goldMcx, latestRates.silverMcx, previousGoldMcx, previousSilverMcx);
 
     if (updatedGold || updatedSilver) {
+      markMarketOpenFromLive("rest-quote");
       refreshMarketClosedState();
       if (goldRateChanged || silverRateChanged || !latestRates.lastUpdated) latestRates.lastUpdated = new Date().toISOString();
       latestRates.source = "upstox-last-quote";
@@ -1364,6 +1379,22 @@ async function getAuthorizedWebSocketUrl() {
     }
     throw error;
   }
+}
+
+function forceReconnectUpstox(delayMs = 250) {
+  upstoxWsConnecting = false;
+  upstoxWsAlive = false;
+  liveFeedStatus = "Reconnect requested";
+  try {
+    if (currentUpstoxWs) {
+      currentUpstoxWs.removeAllListeners("close");
+      currentUpstoxWs.removeAllListeners("error");
+      currentUpstoxWs.close();
+      currentUpstoxWs.terminate?.();
+    }
+  } catch {}
+  currentUpstoxWs = null;
+  setTimeout(connectUpstox, delayMs);
 }
 
 async function connectUpstox() {
@@ -1472,6 +1503,7 @@ async function connectUpstox() {
       }
 
       if (gold != null || silver != null || goldOhlc || silverOhlc) {
+        markMarketOpenFromLive("websocket-live");
         refreshMarketClosedState();
         if (goldRateChanged || silverRateChanged || !latestRates.lastUpdated) latestRates.lastUpdated = new Date().toISOString();
         latestRates.source = "upstox";
@@ -1716,9 +1748,9 @@ app.post("/api/upstox/manual-token", requireAdminJwt, async (req, res) => {
   try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_EXPIRES_AT", accessTokenExpiresAt || ""); } catch {}
   try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_UPDATED_AT", accessTokenUpdatedAt || ""); } catch {}
   try { await updateRenderEnvironmentVariable("UPSTOX_TOKEN_GENERATED_BY", accessTokenGeneratedBy || ""); } catch {}
+  try { await prepareInstrumentKeys(); } catch {}
   try { await fetchLastAvailableQuotes(); } catch {}
-  try { if (currentUpstoxWs) currentUpstoxWs.close(); } catch {}
-  setTimeout(connectUpstox, 1000);
+  forceReconnectUpstox(250);
   broadcast();
   res.json({ ok: true, savedToMongoDB: Boolean(tokenCollection), savedToServerFile: true, renderEnvironment: renderUpdate, accessTokenExpiresAt });
 });
@@ -1815,8 +1847,9 @@ app.get("/api/upstox/callback", async (req, res) => {
     }
     latestRates.status = "Upstox reconnected successfully. Fetching latest rates.";
     latestRates.source = "upstox-reconnected";
+    await prepareInstrumentKeys();
     await fetchLastAvailableQuotes();
-    setTimeout(connectUpstox, 1000);
+    forceReconnectUpstox(250);
 
     res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Upstox Connected</title><style>body{font-family:Arial,sans-serif;background:#111;color:#fff;padding:24px}.card{max-width:650px;margin:auto;background:#1d1d1d;border-radius:18px;padding:24px}.ok{color:#74ff8a}a{color:#ffd36a}</style></head><body><div class="card"><h1 class="ok">TOKEN GENERATED SUCCESSFULLY</h1><p>You can close this page now.</p><p><a href="/api/rates">Check live rates</a></p></div></body></html>`);
   } catch (error) {
