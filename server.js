@@ -200,9 +200,16 @@ function isAfter1159PmOrOvernightIst() {
   return false;
 }
 
-function hasRecentLiveRateActivity(maxAgeMs = 2 * 60 * 1000) {
+function hasRecentLiveRateActivity(maxAgeMs = 15 * 60 * 1000) {
   const t = latestRates.lastUpdated ? new Date(latestRates.lastUpdated).getTime() : 0;
   return Number.isFinite(t) && t > 0 && Date.now() - t <= maxAgeMs && ["upstox", "upstox-last-quote", "atu-token-update", "upstox-reconnected"].includes(latestRates.source);
+}
+
+function hasActiveUpstoxFeed(maxAgeMs = 15 * 60 * 1000) {
+  const t = lastWebSocketMessageAt ? new Date(lastWebSocketMessageAt).getTime() : 0;
+  const recentWsMessage = Number.isFinite(t) && t > 0 && Date.now() - t <= maxAgeMs;
+  const activeStatus = ["Receiving data", "Connected", "Subscribed"].includes(liveFeedStatus);
+  return Boolean(upstoxWsAlive && (recentWsMessage || activeStatus));
 }
 
 function markMarketOpenFromLive(reason = "live-rate") {
@@ -222,7 +229,13 @@ function markMarketOpenFromLive(reason = "live-rate") {
 
 function refreshMarketClosedState() {
   const timeCloseWindowActive = isAfter1159PmOrOvernightIst();
-  const candleCloseActive = Boolean(currentDayCandleMissing && !hasRecentLiveRateActivity());
+  const liveMarketActivityActive = Boolean(hasRecentLiveRateActivity() || hasActiveUpstoxFeed());
+  const candleCloseActive = Boolean(currentDayCandleMissing && !liveMarketActivityActive);
+
+  if (liveMarketActivityActive) {
+    currentDayCandleMissing = false;
+    latestRates.currentDayCandleMissing = false;
+  }
 
   if (!timeCloseWindowActive) {
     marketClosedAfter1159 = false;
