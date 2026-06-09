@@ -169,6 +169,7 @@ function getIstClockParts() {
   const parts = new Intl.DateTimeFormat("en-IN", {
     timeZone: "Asia/Kolkata",
     hour12: false,
+    weekday: "short",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -176,7 +177,17 @@ function getIstClockParts() {
   const hour = Number(parts.find((p) => p.type === "hour")?.value || 0);
   const minute = Number(parts.find((p) => p.type === "minute")?.value || 0);
   const second = Number(parts.find((p) => p.type === "second")?.value || 0);
-  return { hour, minute, second };
+  const weekday = String(parts.find((p) => p.type === "weekday")?.value || "").toLowerCase();
+  return { hour, minute, second, weekday };
+}
+
+function isMcxTradingWindowActiveIst() {
+  // Kept only for compatibility with old code paths.
+  // Market-closed logic below does NOT use fixed morning/weekend rules.
+  const { hour, minute, second } = getIstClockParts();
+  const nowSeconds = hour * 3600 + minute * 60 + second;
+  const closeSeconds = 23 * 3600 + 59 * 60 + 50; // 11:59:50 PM IST
+  return nowSeconds < closeSeconds;
 }
 
 let marketClosedAfter1159 = false;
@@ -188,33 +199,23 @@ let currentDayCandleCheckAt = null;
 
 function isAfter1159PmOrOvernightIst() {
   const { hour, minute, second } = getIstClockParts();
+  const nowSeconds = hour * 3600 + minute * 60 + second;
+  const closeSeconds = 23 * 3600 + 59 * 60 + 50;
 
-  if (hour === 23 && minute === 59 && second >= 50) {
-    return true;
-  }
-
-  if (marketClosedAfter1159 && !marketClosedDisabledByLiveMove) {
-    return true;
-  }
-
+  // User-required rule only: after 11:59:50 PM IST marketClosed becomes true.
+  // It stays true until Gold/Silver MCX rate changes after marketClosed became true.
+  if (nowSeconds >= closeSeconds) return true;
+  if (marketClosedAfter1159 && !marketClosedDisabledByLiveMove) return true;
   return false;
 }
 
-function hasRecentLiveRateActivity(maxAgeMs = 15 * 60 * 1000) {
+function hasRecentLiveRateActivity(maxAgeMs = 2 * 60 * 1000) {
   const t = latestRates.lastUpdated ? new Date(latestRates.lastUpdated).getTime() : 0;
   return Number.isFinite(t) && t > 0 && Date.now() - t <= maxAgeMs && ["upstox", "upstox-last-quote", "atu-token-update", "upstox-reconnected"].includes(latestRates.source);
 }
 
-function hasActiveUpstoxFeed(maxAgeMs = 15 * 60 * 1000) {
-  const t = lastWebSocketMessageAt ? new Date(lastWebSocketMessageAt).getTime() : 0;
-  const recentWsMessage = Number.isFinite(t) && t > 0 && Date.now() - t <= maxAgeMs;
-  const activeStatus = ["Receiving data", "Connected", "Subscribed"].includes(liveFeedStatus);
-  return Boolean(upstoxWsAlive && (recentWsMessage || activeStatus));
-}
-
-function markMarketOpenFromLive(reason = "live-rate") {
-  // If Upstox is giving a live/last quote now, the market must not stay closed
-  // only because today's daily candle is missing or delayed.
+function markMarketOpenFromLive(reason = "rate-change") {
+  // User-required rule only: when Gold/Silver MCX rate changes after marketClosed became true, marketClosed becomes false.
   currentDayCandleMissing = false;
   latestRates.currentDayCandleMissing = false;
   marketClosedAfter1159 = false;
@@ -225,33 +226,21 @@ function markMarketOpenFromLive(reason = "live-rate") {
   latestRates.marketClosedMessage = null;
   latestRates.marketClosedReferenceMode = "previous-trading-close";
   latestRates.marketOpenDetectedBy = reason;
+  return true;
 }
 
 function refreshMarketClosedState() {
-  const timeCloseWindowActive = isAfter1159PmOrOvernightIst();
-  const liveMarketActivityActive = Boolean(hasRecentLiveRateActivity() || hasActiveUpstoxFeed());
-  const candleCloseActive = Boolean(currentDayCandleMissing && !liveMarketActivityActive);
+  const timeClosed = isAfter1159PmOrOvernightIst();
+  const candleClosed = Boolean(currentDayCandleMissing);
 
-  if (liveMarketActivityActive) {
-    currentDayCandleMissing = false;
-    latestRates.currentDayCandleMissing = false;
-  }
-
-  if (!timeCloseWindowActive) {
-    marketClosedAfter1159 = false;
-    marketClosedBaselineGold = null;
-    marketClosedBaselineSilver = null;
-    marketClosedDisabledByLiveMove = false;
-  }
-
-  if (timeCloseWindowActive && !marketClosedDisabledByLiveMove && !marketClosedAfter1159) {
+  if (timeClosed && !marketClosedAfter1159) {
     marketClosedAfter1159 = true;
+    marketClosedDisabledByLiveMove = false;
     marketClosedBaselineGold = Number.isFinite(Number(latestRates.goldMcx)) ? Number(latestRates.goldMcx) : null;
     marketClosedBaselineSilver = Number.isFinite(Number(latestRates.silverMcx)) ? Number(latestRates.silverMcx) : null;
   }
 
-  const timeClosed = Boolean(timeCloseWindowActive && !marketClosedDisabledByLiveMove && marketClosedAfter1159);
-  latestRates.marketClosed = Boolean(timeClosed || candleCloseActive);
+  latestRates.marketClosed = Boolean(timeClosed || candleClosed);
   latestRates.marketClosedMessage = latestRates.marketClosed ? "MARKET CLOSED" : null;
   latestRates.marketClosedReferenceMode = latestRates.marketClosed ? "third-last-trading-close" : "previous-trading-close";
   latestRates.currentDayCandleMissing = currentDayCandleMissing;
@@ -268,7 +257,7 @@ function clearMarketClosedIfRateChanged(nextGold, nextSilver, previousGold = lat
   const silverChanged = Number.isFinite(s) && Number.isFinite(ps) && Math.abs(s - ps) > 0;
   const baselineGoldChanged = Number.isFinite(g) && marketClosedBaselineGold != null && g !== marketClosedBaselineGold;
   const baselineSilverChanged = Number.isFinite(s) && marketClosedBaselineSilver != null && s !== marketClosedBaselineSilver;
-  if (goldChanged || silverChanged || baselineGoldChanged || baselineSilverChanged) {
+  if ((latestRates.marketClosed || marketClosedAfter1159 || currentDayCandleMissing) && (goldChanged || silverChanged || baselineGoldChanged || baselineSilverChanged)) {
     markMarketOpenFromLive("rate-change");
   }
 }
@@ -968,6 +957,14 @@ async function prepareInstrumentKeys() {
   }
 }
 
+
+function getPublicRateStatus(useRecorded) {
+  if (useRecorded) return "LAST RECORDED DATA IS SHOWING BECAUSE TOKEN GOT EXPIRED OR INVALID";
+  if (latestRates.marketClosed) return "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
+  if (tokenWorking && ["Connected", "Receiving data"].includes(liveFeedStatus)) return "Live MCX feed connected.";
+  return latestRates.status;
+}
+
 function calculateRates(goldMcx, silverMcx, req = null) {
   const tokenState = tokenExpiryState();
   const marketClosed = refreshMarketClosedState();
@@ -1020,7 +1017,7 @@ function calculateRates(goldMcx, silverMcx, req = null) {
 
     lastUpdated: useRecorded ? sourceRates.lastUpdated : latestRates.lastUpdated,
     source: useRecorded ? "render-last-recorded" : latestRates.source,
-    status: useRecorded ? "LAST RECORDED DATA IS SHOWING BECAUSE TOKEN GOT EXPIRED OR INVALID" : latestRates.status,
+    status: getPublicRateStatus(useRecorded),
     showingLastRecordedData: Boolean(useRecorded),
     lastRecordedWarning: useRecorded ? "LAST RECORDED DATA IS SHOWING BECAUSE TOKEN GOT EXPIRED OR INVALID" : null,
     lastRecordedRatesUpdatedAt,
@@ -1333,11 +1330,12 @@ async function fetchLastAvailableQuotes() {
     clearMarketClosedIfRateChanged(latestRates.goldMcx, latestRates.silverMcx, previousGoldMcx, previousSilverMcx);
 
     if (updatedGold || updatedSilver) {
-      markMarketOpenFromLive("rest-quote");
       refreshMarketClosedState();
       if (goldRateChanged || silverRateChanged || !latestRates.lastUpdated) latestRates.lastUpdated = new Date().toISOString();
       latestRates.source = "upstox-last-quote";
-      latestRates.status = "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
+      latestRates.status = latestRates.marketClosed
+        ? "Showing last available Upstox quote. Live MCX will update automatically when market opens."
+        : "Showing last available Upstox quote. Waiting for live MCX tick.";
       await refreshHistoricalTradingCloses(false);
       saveCachedRates();
       recordLastGoodRatesToRender("rest-last-quote");
@@ -1516,7 +1514,6 @@ async function connectUpstox() {
       }
 
       if (gold != null || silver != null || goldOhlc || silverOhlc) {
-        markMarketOpenFromLive("websocket-live");
         refreshMarketClosedState();
         if (goldRateChanged || silverRateChanged || !latestRates.lastUpdated) latestRates.lastUpdated = new Date().toISOString();
         latestRates.source = "upstox";
