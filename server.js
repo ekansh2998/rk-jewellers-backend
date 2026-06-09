@@ -121,9 +121,25 @@ function tokenExpiryState() {
   return { expired, valid: Boolean(accessToken) && !expired && !tokenNeedsReconnect, label: expired ? "TOKEN EXPIRED OR NOT WORKING" : accessTokenExpiresAt };
 }
 
+function hasRecentWebSocketActivity(maxAgeMs = 2 * 60 * 1000) {
+  const t = lastWebSocketMessageAt ? new Date(lastWebSocketMessageAt).getTime() : 0;
+  return Number.isFinite(t) && t > 0 && Date.now() - t <= maxAgeMs && ["Connected", "Receiving data"].includes(liveFeedStatus);
+}
+
+function clearTokenReconnectNeeded(reason = "token-working") {
+  tokenNeedsReconnect = false;
+  tokenLastError = null;
+  if (latestRates.status === "TOKEN EXPIRED OR NOT WORKING" || String(latestRates.status || "").includes("TOKEN GOT EXPIRED OR INVALID")) {
+    latestRates.status = reason === "websocket-live" ? "Live rates updated." : "Live MCX feed connected.";
+  }
+}
+
 function tokensWorking() {
   const state = tokenExpiryState();
-  return Boolean(accessToken) && !tokenNeedsReconnect && !state.expired;
+  // If the WebSocket is receiving live data, the token is practically working.
+  // This prevents an old REST/authorize error flag from keeping the app on
+  // "TOKEN EXPIRED OR INVALID" after reconnect/manual token update succeeds.
+  return Boolean(accessToken) && !state.expired && (!tokenNeedsReconnect || hasRecentWebSocketActivity());
 }
 
 function normalizeRecordedRates(data) {
@@ -276,6 +292,7 @@ function setPreviousCloseWithHistory(metal, close) {
 }
 
 function shouldShowLastRecordedRates() {
+  if (hasRecentWebSocketActivity()) return false;
   return !tokensWorking() && lastRecordedRates && (lastRecordedRates.goldMcx || lastRecordedRates.silverMcx);
 }
 
@@ -1026,7 +1043,7 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     lastWebSocketPongAt,
     websocketReconnectCount,
     lastHeartbeatCheckAt,
-    tokenNeedsReconnect: tokenNeedsReconnect || tokenState.expired,
+    tokenNeedsReconnect: (tokenNeedsReconnect && !hasRecentWebSocketActivity()) || tokenState.expired,
     tokenLastError: tokenState.expired ? "TOKEN EXPIRED OR NOT WORKING" : tokenLastError,
     tokenAutoRefreshEnabled,
     refreshTokenPresent: Boolean(refreshToken),
@@ -1036,7 +1053,7 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     tokenExpired: tokenState.expired,
     tokenWorking: tokensWorking(),
     lastAutoRefreshAt,
-    reconnectPath: (tokenNeedsReconnect || tokenState.expired) ? "/upstox" : null,
+    reconnectPath: ((tokenNeedsReconnect && !hasRecentWebSocketActivity()) || tokenState.expired) ? "/upstox" : null,
     mongoConnected: Boolean(tokenCollection),
     tokenStorage: activeTokenSource,
     tokenPriority: "mongodb -> render-env-backup -> server-memory-backup",
@@ -1454,6 +1471,7 @@ async function connectUpstox() {
     upstoxWsAlive = true;
     lastWebSocketPongAt = new Date().toISOString();
     liveFeedStatus = "Connected";
+    clearTokenReconnectNeeded("websocket-connected");
     latestRates.status = "Connected to Upstox WebSocket.";
     latestRates.source = "upstox";
     console.log(latestRates.status);
@@ -1475,6 +1493,7 @@ async function connectUpstox() {
     lastWebSocketMessageAt = new Date().toISOString();
     upstoxWsAlive = true;
     liveFeedStatus = "Receiving data";
+    clearTokenReconnectNeeded("websocket-live");
     try {
       let data;
 
@@ -1751,6 +1770,7 @@ app.post("/api/upstox/manual-token", requireAdminJwt, async (req, res) => {
   const token = String(req.body?.accessToken || "").trim();
   if (!token) return res.status(400).json({ ok: false, message: "Access token is blank." });
   await saveAccessToken({ access_token: token, source: "manual", generatedBy: "manual" });
+  clearTokenReconnectNeeded("manual-token-updated");
   latestRates.status = "Access token manually updated from ATU page.";
   latestRates.source = "atu-token-update";
   const renderUpdate = await updateRenderAccessTokenEnv(token);
@@ -1786,8 +1806,8 @@ app.get("/api/upstox/status", (req, res) => {
     hasApiKey: Boolean(UPSTOX_API_KEY),
     hasApiSecret: Boolean(UPSTOX_API_SECRET),
     hasAccessToken: Boolean(accessToken),
-    tokenNeedsReconnect,
-    tokenLastError,
+    tokenNeedsReconnect: tokenNeedsReconnect && !hasRecentWebSocketActivity(),
+    tokenLastError: hasRecentWebSocketActivity() ? null : tokenLastError,
     loginUrl: UPSTOX_API_KEY ? getUpstoxLoginUrl(req) : null,
     redirectUri: getRedirectUri(req),
     tokenStorage: activeTokenSource,
@@ -1847,6 +1867,7 @@ app.get("/api/upstox/callback", async (req, res) => {
     });
 
     await saveAccessToken({ ...response.data, source: "reconnect-to-upstox", generatedBy: "reconnect-to-upstox" });
+    clearTokenReconnectNeeded("reconnect-to-upstox");
     const newTokenFromReconnect = response.data?.access_token || response.data?.accessToken;
     if (newTokenFromReconnect) {
       const renderUpdate = await updateRenderAccessTokenEnv(newTokenFromReconnect);
