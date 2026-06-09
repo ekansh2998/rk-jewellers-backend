@@ -11,6 +11,20 @@ const path = require("path");
 const { MongoClient } = require("mongodb");
 const crypto = require("crypto");
 
+let SocketIOServer = null;
+try {
+  SocketIOServer = require("socket.io").Server;
+} catch (error) {
+  console.log("Socket.IO package not installed. Existing /live WebSocket will continue working.");
+}
+
+let createRedisClient = null;
+try {
+  createRedisClient = require("redis").createClient;
+} catch (error) {
+  console.log("Redis package not installed. File cache will continue working.");
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -38,6 +52,13 @@ const TOKEN_DOC_ID = "main-upstox-token";
 let mongoClient = null;
 let tokenCollection = null;
 let mongoLastError = null;
+
+const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || "";
+const REDIS_RATES_KEY = process.env.REDIS_RATES_KEY || "rk-jewellers:latest-rates";
+let redisClient = null;
+let redisConnected = false;
+let redisLastError = null;
+let io = null;
 
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || process.env.UPSTOX_CLIENT_ID || process.env.API_KEY || "";
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || process.env.CLIENT_SECRET || process.env.API_SECRET || "";
@@ -98,6 +119,63 @@ let latestRates = {
   source: "waiting",
   status: "Server started. Waiting for Upstox feed.",
 };
+
+async function initRedisCache() {
+  if (!createRedisClient || !REDIS_URL) {
+    redisConnected = false;
+    redisLastError = !REDIS_URL ? "REDIS_URL not configured" : "redis package not installed";
+    return false;
+  }
+
+  try {
+    redisClient = createRedisClient({ url: REDIS_URL });
+    redisClient.on("error", (error) => {
+      redisConnected = false;
+      redisLastError = error.message;
+      console.log("Redis error:", error.message);
+    });
+    redisClient.on("ready", () => {
+      redisConnected = true;
+      redisLastError = null;
+      console.log("Redis cache connected.");
+    });
+    await redisClient.connect();
+    redisConnected = true;
+    redisLastError = null;
+    return true;
+  } catch (error) {
+    redisConnected = false;
+    redisLastError = error.message;
+    console.log("Redis cache connection failed:", error.message);
+    return false;
+  }
+}
+
+async function loadRedisCachedRates() {
+  if (!redisClient || !redisConnected) return false;
+  try {
+    const cachedText = await redisClient.get(REDIS_RATES_KEY);
+    if (!cachedText) return false;
+    const cached = JSON.parse(cachedText);
+    latestRates = { ...latestRates, ...cached, source: "redis-cache", status: "Showing Redis cached last available rates until live MCX starts." };
+    console.log("Loaded saved last available rates from Redis cache.");
+    return true;
+  } catch (error) {
+    redisLastError = error.message;
+    console.log("Could not load Redis rates cache:", error.message);
+    return false;
+  }
+}
+
+function saveRedisRatesCache() {
+  if (!redisClient || !redisConnected) return;
+  const payload = JSON.stringify(latestRates);
+  redisClient.set(REDIS_RATES_KEY, payload).catch((error) => {
+    redisConnected = false;
+    redisLastError = error.message;
+    console.log("Could not save Redis rates cache:", error.message);
+  });
+}
 
 function parseJsonEnv(key, fallback = null) {
   try {
@@ -311,6 +389,7 @@ function saveCachedRates() {
   try {
     if (latestRates.goldMcx == null && latestRates.silverMcx == null) return;
     fs.writeFileSync(CACHE_FILE, JSON.stringify(latestRates, null, 2));
+    saveRedisRatesCache();
   } catch (error) {
     console.log("Could not save rates cache:", error.message);
   }
@@ -978,7 +1057,7 @@ async function prepareInstrumentKeys() {
 function getPublicRateStatus(useRecorded) {
   if (useRecorded) return "LAST RECORDED DATA IS SHOWING BECAUSE TOKEN GOT EXPIRED OR INVALID";
   if (latestRates.marketClosed) return "Showing last available Upstox quote. Live MCX will update automatically when market opens.";
-  if (tokenWorking && ["Connected", "Receiving data"].includes(liveFeedStatus)) return "Live MCX feed connected.";
+  if (tokensWorking() && ["Connected", "Receiving data"].includes(liveFeedStatus)) return "Live MCX feed connected.";
   return latestRates.status;
 }
 
@@ -1055,6 +1134,9 @@ function calculateRates(goldMcx, silverMcx, req = null) {
     lastAutoRefreshAt,
     reconnectPath: ((tokenNeedsReconnect && !hasRecentWebSocketActivity()) || tokenState.expired) ? "/upstox" : null,
     mongoConnected: Boolean(tokenCollection),
+    redisConnected,
+    redisLastError,
+    socketIoEnabled: Boolean(io),
     tokenStorage: activeTokenSource,
     tokenPriority: "mongodb -> render-env-backup -> server-memory-backup",
     usingRenderBackupToken: activeTokenSource === "render-env-backup" && tokensWorking(),
@@ -1085,6 +1167,7 @@ function broadcast() {
   for (const client of clients) {
     if (client.readyState === WebSocket.OPEN) client.send(payload);
   }
+  if (io) io.emit("rates", { type: "rates", data: calculateRates(latestRates.goldMcx, latestRates.silverMcx) });
 }
 
 function getFeed(raw, instrumentKey) {
@@ -1796,6 +1879,9 @@ app.get("/api/upstox/current-token", requireAdminJwt, (req, res) => {
     accessTokenExpiresAt,
     tokenStorage: activeTokenSource,
     mongoConnected: Boolean(tokenCollection),
+    redisConnected,
+    redisLastError,
+    socketIoEnabled: Boolean(io),
     mongoWarning: getMongoFallbackMessage(),
   });
 });
@@ -2043,6 +2129,8 @@ app.post("/api/rate-difference", requireAdminJwt, async (req, res) => {
 
 async function startServer() {
   await initMongoTokenStore();
+  await initRedisCache();
+  await loadRedisCachedRates();
   await loadSavedAccessToken();
   await prepareInstrumentKeys();
   refreshHistoricalTradingCloses(true).catch(() => {});
@@ -2060,6 +2148,22 @@ async function startServer() {
     console.log(`Backend running at http://localhost:${PORT}`);
     connectUpstox();
   });
+
+  if (SocketIOServer) {
+    io = new SocketIOServer(httpServer, {
+      cors: { origin: "*", methods: ["GET", "POST"] },
+      path: "/socket.io",
+    });
+
+    io.on("connection", (socket) => {
+      socket.emit("rates", {
+        type: "rates",
+        data: calculateRates(latestRates.goldMcx, latestRates.silverMcx),
+      });
+    });
+
+    console.log("Socket.IO live update server enabled at /socket.io.");
+  }
 
   const wss = new WebSocket.Server({ server: httpServer, path: "/live" });
 
